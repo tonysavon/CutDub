@@ -1,0 +1,13 @@
+[package]
+name = "redub-preview"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true
+rodio.workspace = true
+redub-platform.workspace = true
+redub-core.workspace = true
+redub-media.workspace = true

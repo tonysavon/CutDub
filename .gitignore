@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+*.cutdub.json
+.DS_Store
+
+# Local FFmpeg checkout and packaged builds
+/FFmpeg/
+/releases/
+/.vscode/

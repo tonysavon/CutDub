@@ -1,0 +1,26 @@
+[package]
+name = "redub-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+default-run = "cutdub"
+
+[[bin]]
+name = "cutdub"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+egui.workspace = true
+eframe.workspace = true
+rfd.workspace = true
+redub-platform.workspace = true
+redub-core.workspace = true
+redub-media.workspace = true
+redub-filters.workspace = true
+redub-preview.workspace = true
+redub-export.workspace = true

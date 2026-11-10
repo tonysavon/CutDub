@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/redub-platform",
+    "crates/redub-core",
+    "crates/redub-media",
+    "crates/redub-filters",
+    "crates/redub-preview",
+    "crates/redub-export",
+    "crates/redub-app",
+]
+default-members = ["crates/redub-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+authors = ["CutDub Contributors"]
+
+[workspace.dependencies]
+anyhow = "1.0"
+thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+egui = "0.31"
+eframe = { version = "0.31", default-features = false, features = [
+    "default_fonts",
+    "wgpu",
+    "persistence",
+] }
+rfd = "0.15"
+directories = "6.0"
+tempfile = "3.14"
+rodio = { version = "0.20", default-features = false }
+
+redub-platform = { path = "crates/redub-platform" }
+redub-core = { path = "crates/redub-core" }
+redub-media = { path = "crates/redub-media" }
+redub-filters = { path = "crates/redub-filters" }
+redub-preview = { path = "crates/redub-preview" }
+redub-export = { path = "crates/redub-export" }
