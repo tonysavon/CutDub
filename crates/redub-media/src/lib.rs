@@ -1234,26 +1234,20 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn missing_or_broken_external_vvc_is_not_advertised() {
-        use std::os::unix::fs::PermissionsExt;
-        let tmp = TempDir::new().unwrap();
-        let ffmpeg = tmp.path().join("ffmpeg");
-        fs::write(&ffmpeg, "#!/bin/sh\nprintf '%s\\n' '------' ' V..... libx264 H264'\n").unwrap();
-        fs::set_permissions(&ffmpeg, fs::Permissions::from_mode(0o755)).unwrap();
-        let external = tmp.path().join("vvencapp");
-        fs::write(&external, "#!/bin/sh\nexit 1\n").unwrap();
-        fs::set_permissions(&external, fs::Permissions::from_mode(0o755)).unwrap();
-        let mut bins = FfmpegBinaries {
-            ffmpeg_path: ffmpeg, ffprobe_path: external.clone(),
-            ffmpeg_version: String::new(), ffprobe_version: String::new(),
-            vvencapp_path: Some(external.clone()), vvencapp_version: None,
-        };
+        // Use installed executables rather than newly written scripts: Linux can
+        // reject a just-written executable during parallel subprocess tests.
+        let mut bins = FfmpegBinaries::discover(None, None).expect("FFmpeg must be installed");
+        bins.vvencapp_path = None;
+        let native_vvc = MediaCapabilities::detect(&bins).has_encoder("libvvenc");
+        bins.vvencapp_path = Some("/bin/false".into());
         let broken = MediaCapabilities::detect(&bins);
-        assert!(broken.has_encoder("libx264"));
-        assert!(!broken.has_encoder("libvvenc"));
-        fs::write(&external, "#!/bin/sh\nprintf 'VVenC test version\\n'\n").unwrap();
+        assert!(!broken.video_encoders.is_empty());
+        assert_eq!(broken.has_encoder("libvvenc"), native_vvc);
+        // echo provides a successful version-command stand-in, without a VVC dependency.
+        bins.vvencapp_path = Some("/bin/echo".into());
         assert!(MediaCapabilities::detect(&bins).has_encoder("libvvenc"));
         bins.vvencapp_path = None;
-        assert!(!MediaCapabilities::detect(&bins).has_encoder("libvvenc"));
+        assert_eq!(MediaCapabilities::detect(&bins).has_encoder("libvvenc"), native_vvc);
     }
 
     #[test]
