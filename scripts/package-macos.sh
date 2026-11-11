@@ -3,7 +3,7 @@ set -euo pipefail
 
 APP_NAME="CutDub"
 BIN_NAME="cutdub"
-VERSION="${1:-0.1.0}"
+VERSION="${1:-0.1.1}"
 TARGET="${2:-$(rustc -vV | sed -n 's/^host: //p')}"
 case "$TARGET" in
     aarch64-apple-darwin) ARCH="arm64" ;;
@@ -12,7 +12,7 @@ case "$TARGET" in
 esac
 
 echo "==> Building ${APP_NAME} v${VERSION} (${ARCH}) in release mode..."
-cargo build --release --bin "${BIN_NAME}" --target "${TARGET}"
+cargo build --locked --release --bin "${BIN_NAME}" --target "${TARGET}"
 
 DIST_DIR="releases/${VERSION}"
 BUNDLE_DIR="${DIST_DIR}/${APP_NAME}.app"
@@ -23,6 +23,7 @@ mkdir -p "${BUNDLE_DIR}/Contents/Resources"
 cp "target/${TARGET}/release/${BIN_NAME}" "${BUNDLE_DIR}/Contents/MacOS/${BIN_NAME}"
 chmod +x "${BUNDLE_DIR}/Contents/MacOS/${BIN_NAME}"
 cp LICENSE README.md "${BUNDLE_DIR}/Contents/Resources/"
+cp assets/icons/CutDub.icns "${BUNDLE_DIR}/Contents/Resources/CutDub.icns"
 
 cat > "${BUNDLE_DIR}/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -43,6 +44,8 @@ cat > "${BUNDLE_DIR}/Contents/Info.plist" <<EOF
     <string>APPL</string>
     <key>CFBundleExecutable</key>
     <string>${BIN_NAME}</string>
+    <key>CFBundleIconFile</key>
+    <string>CutDub.icns</string>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>LSMinimumSystemVersion</key>
@@ -50,6 +53,9 @@ cat > "${BUNDLE_DIR}/Contents/Info.plist" <<EOF
 </dict>
 </plist>
 EOF
+
+codesign --force --sign - "${BUNDLE_DIR}"
+codesign --verify --strict "${BUNDLE_DIR}"
 
 ARCHIVE_PATH="${DIST_DIR}/${APP_NAME}-${VERSION}-macos-${ARCH}.tar.gz"
 tar -czf "${ARCHIVE_PATH}" -C "${DIST_DIR}" "${APP_NAME}.app"

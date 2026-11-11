@@ -4,7 +4,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -237,11 +237,37 @@ impl PlaybackClock {
 
 #[derive(Debug, Clone)]
 struct DecodeJob {
+    generation: u64,
     clip: Arc<SourceClip>,
     start_frame: u64,
-    is_playing: bool,
-    burst_count: Option<usize>,
     max_dimension: Option<u32>,
+}
+
+/// Direction and spacing of deliberate keyboard navigation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NavigationHint {
+    Frames(i64),
+    Keyframes { backwards: bool },
+}
+
+fn navigation_targets(clip: &SourceClip, frame: u64, hint: NavigationHint) -> Vec<u64> {
+    let mut targets = Vec::new();
+    let mut current = frame;
+    for _ in 0..3 {
+        let next = match hint {
+            NavigationHint::Frames(delta) => current
+                .saturating_add_signed(delta)
+                .min(clip.timing.total_frames().saturating_sub(1)),
+            NavigationHint::Keyframes { backwards: true } => clip.timing.prev_keyframe(current),
+            NavigationHint::Keyframes { backwards: false } => clip.timing.next_keyframe(current),
+        };
+        if next == current {
+            break;
+        }
+        targets.push(next);
+        current = next;
+    }
+    targets
 }
 
 /// Number of frames to keep decoded ahead of the playhead during continuous playback.
@@ -252,14 +278,19 @@ const STREAM_LOOKAHEAD_FRAMES: u64 = 45;
 pub struct PreviewEngine {
     pub cache: FrameCache,
     latest_job: Arc<Mutex<Option<DecodeJob>>>,
+    prefetch_jobs: Arc<Mutex<VecDeque<DecodeJob>>>,
+    pub navigation_hint: Option<NavigationHint>,
     playhead_frame: Arc<AtomicU64>,
     is_playing_flag: Arc<AtomicBool>,
     stream_active: Arc<AtomicBool>,
     stream_head_frame: Arc<AtomicU64>,
     stream_start_frame: Arc<AtomicU64>,
     wakeup_tx: Sender<()>,
-    result_rx: Receiver<DecodedFrame>,
-    last_scrub_request: Option<(usize, u64)>,
+    result_rx: Receiver<(u64, DecodedFrame)>,
+    generation: Arc<AtomicU64>,
+    active_child: Arc<Mutex<Option<Arc<Mutex<Child>>>>>,
+    last_navigation_request: Option<(usize, u64)>,
+    stream_source_id: Option<usize>,
     pub max_preview_dimension: Option<u32>,
 }
 
@@ -267,17 +298,22 @@ impl PreviewEngine {
     pub fn new(decoder: FfmpegProcessDecoder, cache_capacity: usize) -> Self {
         let cap = cache_capacity.max(96);
         let latest_job: Arc<Mutex<Option<DecodeJob>>> = Arc::new(Mutex::new(None));
+        let prefetch_jobs = Arc::new(Mutex::new(VecDeque::<DecodeJob>::new()));
+        let worker_prefetch = Arc::clone(&prefetch_jobs);
         let playhead_frame = Arc::new(AtomicU64::new(0));
         let is_playing_flag = Arc::new(AtomicBool::new(false));
         let stream_active = Arc::new(AtomicBool::new(false));
         let stream_head_frame = Arc::new(AtomicU64::new(0));
         let stream_start_frame = Arc::new(AtomicU64::new(0));
         let (wakeup_tx, wakeup_rx) = mpsc::channel::<()>();
-        let (result_tx, result_rx) = mpsc::channel::<DecodedFrame>();
+        let (result_tx, result_rx) = mpsc::channel::<(u64, DecodedFrame)>();
+        let generation = Arc::new(AtomicU64::new(0));
+        let worker_generation = Arc::clone(&generation);
+        let active_child: Arc<Mutex<Option<Arc<Mutex<Child>>>>> = Arc::new(Mutex::new(None));
+        let worker_child = Arc::clone(&active_child);
 
         let job_slot = Arc::clone(&latest_job);
         let playhead_shared = Arc::clone(&playhead_frame);
-        let playing_shared = Arc::clone(&is_playing_flag);
         let active_shared = Arc::clone(&stream_active);
         let head_shared = Arc::clone(&stream_head_frame);
         let start_shared = Arc::clone(&stream_start_frame);
@@ -286,43 +322,35 @@ impl PreviewEngine {
             .name("cutdub-preview-decoder".into())
             .spawn(move || {
                 let mut active_stream: Option<ContinuousFrameStream> = None;
-                let mut stream_is_continuous = false;
+                let mut stream_generation = 0;
 
                 loop {
+                    if stream_generation != worker_generation.load(Ordering::SeqCst) {
+                        active_stream = None;
+                    }
                     let maybe_job = {
                         let mut guard = job_slot.lock().unwrap();
                         guard.take()
                     };
 
                     if let Some(job) = maybe_job {
-                        let can_reuse = if let Some(ref stream) = active_stream {
-                            stream.clip.id == job.clip.id
-                                && job.start_frame >= stream.next_frame
-                                && job.start_frame <= stream.next_frame + 12
-                                && (stream_is_continuous == job.is_playing)
-                        } else {
-                            false
-                        };
-
-                        if !can_reuse {
+                        // Each job supersedes the previous decode, including any blocked read.
+                        if job.generation != worker_generation.load(Ordering::SeqCst) {
+                            continue;
+                        }
+                        stream_generation = job.generation;
+                        {
                             active_stream = None;
-                            stream_is_continuous = job.is_playing;
-                            let max_frames = if job.is_playing {
-                                None
-                            } else {
-                                job.burst_count
-                            };
-
                             start_shared.store(job.start_frame, Ordering::SeqCst);
                             head_shared.store(job.start_frame, Ordering::SeqCst);
-                            active_shared.store(job.is_playing, Ordering::SeqCst);
+                            active_shared.store(true, Ordering::SeqCst);
 
                             let spawned = if decoder.prefer_hwaccel {
                                 decoder
                                     .spawn_stream(
                                         Arc::clone(&job.clip),
                                         job.start_frame,
-                                        max_frames,
+                                        None,
                                         job.max_dimension,
                                         true,
                                     )
@@ -330,7 +358,7 @@ impl PreviewEngine {
                                         decoder.spawn_stream(
                                             Arc::clone(&job.clip),
                                             job.start_frame,
-                                            max_frames,
+                                            None,
                                             job.max_dimension,
                                             false,
                                         )
@@ -339,7 +367,7 @@ impl PreviewEngine {
                                 decoder.spawn_stream(
                                     Arc::clone(&job.clip),
                                     job.start_frame,
-                                    max_frames,
+                                    None,
                                     job.max_dimension,
                                     false,
                                 )
@@ -347,6 +375,14 @@ impl PreviewEngine {
 
                             match spawned {
                                 Ok(s) => {
+                                    let mut child_slot = worker_child.lock().unwrap();
+                                    if stream_generation != worker_generation.load(Ordering::SeqCst)
+                                    {
+                                        drop(child_slot);
+                                        drop(s);
+                                        continue;
+                                    }
+                                    *child_slot = Some(s.cancellation_handle());
                                     active_stream = Some(s);
                                 }
                                 Err(e) => {
@@ -359,34 +395,59 @@ impl PreviewEngine {
 
                     if let Some(ref mut stream) = active_stream {
                         let cur_playhead = playhead_shared.load(Ordering::Relaxed);
-                        let is_playing = playing_shared.load(Ordering::Relaxed);
-
-                        // If user paused a continuous stream and we have buffered 6 frames ahead, close it
-                        if stream_is_continuous
-                            && !is_playing
-                            && stream.next_frame > cur_playhead + 6
-                        {
-                            active_stream = None;
-                            active_shared.store(false, Ordering::SeqCst);
-                            continue;
-                        }
-
-                        // Flow control: keep up to STREAM_LOOKAHEAD_FRAMES buffered ahead of playhead
-                        if stream_is_continuous
-                            && is_playing
-                            && stream.next_frame > cur_playhead + STREAM_LOOKAHEAD_FRAMES
-                        {
-                            let _ = wakeup_rx.recv_timeout(Duration::from_millis(5));
+                        // Keep the decoder open while paused too: stepping consumes this
+                        // rolling buffer without another process startup or keyframe seek.
+                        if stream.next_frame > cur_playhead + STREAM_LOOKAHEAD_FRAMES {
+                            // Speculation runs only after the foreground rolling buffer
+                            // is full. A new seek cancels it through the same child handle.
+                            let speculative = worker_prefetch.lock().unwrap().pop_front();
+                            if let Some(job) = speculative {
+                                if job.generation != worker_generation.load(Ordering::SeqCst) {
+                                    continue;
+                                }
+                                if let Ok(mut ahead) = decoder.spawn_stream(
+                                    job.clip,
+                                    job.start_frame,
+                                    Some(1),
+                                    job.max_dimension,
+                                    false,
+                                ) {
+                                    {
+                                        let mut slot = worker_child.lock().unwrap();
+                                        if job.generation
+                                            != worker_generation.load(Ordering::SeqCst)
+                                        {
+                                            continue;
+                                        }
+                                        *slot = Some(ahead.cancellation_handle());
+                                    }
+                                    if let Ok(Some(frame)) = ahead.read_next_frame() {
+                                        if result_tx.send((job.generation, frame)).is_err() {
+                                            break;
+                                        }
+                                    }
+                                    *worker_child.lock().unwrap() =
+                                        Some(stream.cancellation_handle());
+                                }
+                                continue;
+                            }
+                            if matches!(
+                                wakeup_rx.recv_timeout(Duration::from_millis(5)),
+                                Err(mpsc::RecvTimeoutError::Disconnected)
+                            ) {
+                                break;
+                            }
                             while wakeup_rx.try_recv().is_ok() {}
                             continue;
                         }
 
                         match stream.read_next_frame() {
                             Ok(Some(frame)) => {
-                                head_shared.store(stream.next_frame, Ordering::Relaxed);
-                                if result_tx.send(frame).is_err() {
+                                if result_tx.send((stream_generation, frame)).is_err() {
                                     break;
                                 }
+                                // Publish progress after making the frame available to the UI.
+                                head_shared.store(stream.next_frame, Ordering::SeqCst);
                             }
                             Ok(None) | Err(_) => {
                                 active_stream = None;
@@ -407,6 +468,8 @@ impl PreviewEngine {
         Self {
             cache: FrameCache::new(cap),
             latest_job,
+            prefetch_jobs,
+            navigation_hint: None,
             playhead_frame,
             is_playing_flag,
             stream_active,
@@ -414,7 +477,10 @@ impl PreviewEngine {
             stream_start_frame,
             wakeup_tx,
             result_rx,
-            last_scrub_request: None,
+            generation,
+            active_child,
+            last_navigation_request: None,
+            stream_source_id: None,
             max_preview_dimension: Some(960),
         }
     }
@@ -423,11 +489,72 @@ impl PreviewEngine {
     /// Returns `true` if new frames arrived.
     pub fn poll_decoded_frames(&mut self) -> bool {
         let mut received = false;
-        while let Ok(frame) = self.result_rx.try_recv() {
+        while let Ok((generation, frame)) = self.result_rx.try_recv() {
+            if generation != self.generation.load(Ordering::SeqCst) {
+                continue;
+            }
             self.cache.insert(frame);
             received = true;
         }
         received
+    }
+
+    /// Invalidate outstanding results before replacing a source (IDs can be reused).
+    pub fn reset(&mut self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.latest_job.lock().unwrap().take();
+        self.prefetch_jobs.lock().unwrap().clear();
+        self.cancel_decode();
+        self.is_playing_flag.store(false, Ordering::Relaxed);
+        self.stream_active.store(false, Ordering::SeqCst);
+        self.last_navigation_request = None;
+        self.navigation_hint = None;
+        self.stream_source_id = None;
+        self.cache.clear();
+    }
+
+    fn cancel_decode(&self) {
+        if let Some(child) = self.active_child.lock().unwrap().take() {
+            let _ = child.lock().unwrap().kill();
+        }
+    }
+
+    fn submit(&mut self, mut job: DecodeJob) {
+        self.prefetch_jobs.lock().unwrap().clear();
+        job.generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        self.cancel_decode();
+        self.stream_active.store(true, Ordering::SeqCst);
+        *self.latest_job.lock().unwrap() = Some(job);
+        let _ = self.wakeup_tx.send(());
+    }
+
+    /// Prepare sparse upcoming targets without displacing foreground decoding.
+    pub fn prefetch_navigation(&self, clip: &SourceClip, source_frame: u64) {
+        let Some(hint) = self.navigation_hint else {
+            return;
+        };
+        let generation = self.generation.load(Ordering::SeqCst);
+        let jobs = navigation_targets(clip, source_frame, hint)
+            .into_iter()
+            .filter(|&frame| {
+                // Forward targets inside the rolling buffer are already being
+                // prepared by the persistent stream; avoid redundant FFmpeg jobs.
+                !(frame >= source_frame
+                    && frame <= source_frame.saturating_add(STREAM_LOOKAHEAD_FRAMES))
+                    && !self.cache.contains(FrameKey {
+                        source_id: clip.id,
+                        source_frame: frame,
+                    })
+            })
+            .map(|start_frame| DecodeJob {
+                generation,
+                clip: Arc::new(clip.clone()),
+                start_frame,
+                max_dimension: self.max_preview_dimension,
+            })
+            .collect();
+        *self.prefetch_jobs.lock().unwrap() = jobs;
+        let _ = self.wakeup_tx.send(());
     }
 
     pub fn sync_playhead(&self, source_frame: u64, is_playing: bool) {
@@ -444,6 +571,9 @@ impl PreviewEngine {
         is_playing: bool,
     ) -> Option<DecodedFrame> {
         self.poll_decoded_frames();
+        if is_playing {
+            self.prefetch_jobs.lock().unwrap().clear();
+        }
 
         self.playhead_frame.store(source_frame, Ordering::Relaxed);
         self.is_playing_flag.store(is_playing, Ordering::Relaxed);
@@ -453,61 +583,78 @@ impl PreviewEngine {
             source_frame,
         };
 
-        let cached = self.cache.get(key);
+        let mut cached = self.cache.get(key);
+        let backwards = self
+            .last_navigation_request
+            .is_some_and(|(id, previous)| id == clip.id && source_frame < previous);
+        self.last_navigation_request = Some((clip.id, source_frame));
 
-        if is_playing {
-            self.last_scrub_request = None;
-            let _ = self.wakeup_tx.send(());
+        let _ = self.wakeup_tx.send(());
+        let active = self.stream_active.load(Ordering::SeqCst);
+        let head = self.stream_head_frame.load(Ordering::SeqCst);
+        let start = self.stream_start_frame.load(Ordering::SeqCst);
+        // Results can arrive between the initial poll and observing worker progress.
+        // Drain them once more before deciding a frame behind the decoder was evicted.
+        if cached.is_none() && source_frame < head {
+            self.poll_decoded_frames();
+            cached = self.cache.get(key);
+        }
+        let covered_by_stream = active
+            && self.stream_source_id == Some(clip.id)
+            && source_frame >= start
+            // A forward-only stream cannot reproduce a missing frame it passed.
+            && (cached.is_some() || source_frame >= head)
+            && source_frame <= head.saturating_add(20);
 
-            let active = self.stream_active.load(Ordering::SeqCst);
-            let head = self.stream_head_frame.load(Ordering::SeqCst);
-            let start = self.stream_start_frame.load(Ordering::SeqCst);
-
-            // Check if the continuous stream is already covering our current playhead trajectory
-            let covered_by_stream = active
-                && source_frame >= start
-                && source_frame <= head + 20;
-
-            if !covered_by_stream {
-                let start_at = if cached.is_none() {
-                    source_frame
-                } else {
-                    source_frame + 1
-                };
-                self.stream_start_frame.store(start_at, Ordering::SeqCst);
-                self.stream_head_frame.store(start_at, Ordering::SeqCst);
-                self.stream_active.store(true, Ordering::SeqCst);
-
-                if let Ok(mut guard) = self.latest_job.lock() {
-                    *guard = Some(DecodeJob {
-                        clip: Arc::new(clip.clone()),
-                        start_frame: start_at,
-                        is_playing: true,
-                        burst_count: None,
-                        max_dimension: self.max_preview_dimension,
-                    });
-                }
-                let _ = self.wakeup_tx.send(());
-            }
-        } else if cached.is_none() {
-            // Paused / interactive scrubbing: decode a small 3-frame burst and deliver Frame #0 immediately
-            let req = (clip.id, source_frame);
-            if self.last_scrub_request != Some(req) {
-                self.last_scrub_request = Some(req);
-                if let Ok(mut guard) = self.latest_job.lock() {
-                    *guard = Some(DecodeJob {
-                        clip: Arc::new(clip.clone()),
-                        start_frame: source_frame,
-                        is_playing: false,
-                        burst_count: Some(3),
-                        max_dimension: self.max_preview_dimension,
-                    });
-                }
-                let _ = self.wakeup_tx.send(());
-            }
+        // Cached backward steps need no restart. Forward steps keep consuming the
+        // same stream, even across the old 16-frame burst boundary or Play/Pause.
+        let sparse_forward_jump = matches!(
+            self.navigation_hint,
+            Some(NavigationHint::Keyframes { backwards: false })
+        ) && source_frame > head.saturating_add(20);
+        if !covered_by_stream && (cached.is_none() || is_playing || sparse_forward_jump) {
+            let start_frame = if backwards && !is_playing {
+                scrub_window(source_frame, true).0
+            } else if cached.is_some() {
+                source_frame
+                    .saturating_add(1)
+                    .min(clip.timing.total_frames().saturating_sub(1))
+            } else {
+                source_frame
+            };
+            self.stream_source_id = Some(clip.id);
+            self.stream_start_frame.store(start_frame, Ordering::SeqCst);
+            self.stream_head_frame.store(start_frame, Ordering::SeqCst);
+            self.submit(DecodeJob {
+                generation: 0,
+                clip: Arc::new(clip.clone()),
+                start_frame,
+                max_dimension: self.max_preview_dimension,
+            });
         }
 
         cached
+    }
+}
+
+// Forward steps deliver the requested frame first. Reverse steps amortize a seek
+// across a short window preceding the cursor, rather than spawning once per step.
+fn scrub_window(frame: u64, backwards: bool) -> (u64, usize) {
+    let start = if backwards {
+        frame.saturating_sub(12)
+    } else {
+        frame
+    };
+    (start, (frame - start) as usize + 16)
+}
+
+impl Drop for PreviewEngine {
+    fn drop(&mut self) {
+        self.latest_job.lock().unwrap().take();
+        self.prefetch_jobs.lock().unwrap().clear();
+        self.is_playing_flag.store(false, Ordering::Relaxed);
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.cancel_decode();
     }
 }
 
@@ -725,6 +872,192 @@ impl Drop for AudioPreviewPlayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scrub_windows_prefetch_in_navigation_direction() {
+        assert_eq!(scrub_window(100, false), (100, 16));
+        assert_eq!(scrub_window(99, true), (87, 28));
+        assert_eq!(scrub_window(3, true), (0, 19));
+        assert_eq!(scrub_window(0, true), (0, 16));
+    }
+
+    #[test]
+    fn paused_forward_steps_refill_without_restarting_decoder() {
+        let bins = FfmpegBinaries::discover(None, None).expect("FFmpeg must be installed");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("stepping.mp4");
+        redub_media::generate_synthetic_video(&bins, &path, 64, 48, 30, 6.0, 30).unwrap();
+        let clip = redub_media::probe_media_file(&bins, &path, true).unwrap();
+        let mut engine = PreviewEngine::new(FfmpegProcessDecoder::new(bins, false), 96);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while engine.request_frame(&clip, 0, false).is_none() {
+            assert!(Instant::now() < deadline, "initial frame never arrived");
+            thread::sleep(Duration::from_millis(2));
+        }
+        let generation = engine.generation.load(Ordering::SeqCst);
+        // Cross several former burst boundaries and refill the rolling buffer.
+        for frame in 1..100 {
+            while engine.request_frame(&clip, frame, false).is_none() {
+                assert!(Instant::now() < deadline, "step {frame} never arrived");
+                thread::sleep(Duration::from_millis(2));
+            }
+            assert_eq!(
+                engine.generation.load(Ordering::SeqCst),
+                generation,
+                "forward step {frame} restarted FFmpeg"
+            );
+        }
+        // Pausing and resuming also preserve the existing decoder.
+        engine.request_frame(&clip, 100, true);
+        engine.request_frame(&clip, 100, false);
+        assert_eq!(engine.generation.load(Ordering::SeqCst), generation);
+        // A genuine seek outside the buffered trajectory still replaces it.
+        engine.request_frame(&clip, 170, false);
+        assert!(engine.generation.load(Ordering::SeqCst) > generation);
+    }
+
+    #[test]
+    fn keyframe_prefetch_populates_sparse_targets_without_moving_playhead() {
+        let bins = FfmpegBinaries::discover(None, None).expect("FFmpeg must be installed");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("prefetch.mp4");
+        redub_media::generate_synthetic_video(&bins, &path, 64, 48, 30, 12.0, 90).unwrap();
+        let clip = redub_media::probe_media_file(&bins, &path, true).unwrap();
+        assert_eq!(
+            navigation_targets(&clip, 0, NavigationHint::Frames(10)),
+            vec![10, 20, 30]
+        );
+        assert_eq!(
+            navigation_targets(&clip, 30, NavigationHint::Frames(-10)),
+            vec![20, 10, 0]
+        );
+        assert_eq!(
+            navigation_targets(&clip, 0, NavigationHint::Keyframes { backwards: false }),
+            vec![90, 180, 270]
+        );
+        let mut engine = PreviewEngine::new(FfmpegProcessDecoder::new(bins, false), 96);
+        engine.navigation_hint = Some(NavigationHint::Keyframes { backwards: false });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while engine.request_frame(&clip, 0, false).is_none() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(2));
+        }
+        let generation = engine.generation.load(Ordering::SeqCst);
+        engine.prefetch_navigation(&clip, 0);
+        loop {
+            engine.poll_decoded_frames();
+            if [90, 180, 270].iter().all(|&source_frame| {
+                engine.cache.contains(FrameKey {
+                    source_id: clip.id,
+                    source_frame,
+                })
+            }) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "sparse targets were not prefetched"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(engine.playhead_frame.load(Ordering::Relaxed), 0);
+        assert_eq!(engine.generation.load(Ordering::SeqCst), generation);
+        assert!(engine.request_frame(&clip, 90, false).is_some());
+        engine.reset();
+        assert!(engine.prefetch_jobs.lock().unwrap().is_empty());
+        assert!(engine.cache.is_empty());
+    }
+
+    #[test]
+    fn direction_changes_redecode_frames_evicted_behind_the_stream() {
+        let bins = FfmpegBinaries::discover(None, None).expect("FFmpeg must be installed");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("direction_changes.mp4");
+        redub_media::generate_synthetic_video(&bins, &path, 64, 48, 30, 12.0, 30).unwrap();
+        let clip = redub_media::probe_media_file(&bins, &path, true).unwrap();
+        let mut engine = PreviewEngine::new(FfmpegProcessDecoder::new(bins, false), 96);
+        let wait_for = |engine: &mut PreviewEngine, frame| {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                if let Some(decoded) = engine.request_frame(&clip, frame, false) {
+                    assert_eq!(decoded.source_frame, frame);
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "navigation stuck on frame {frame}"
+                );
+                thread::sleep(Duration::from_millis(2));
+            }
+        };
+        for frame in 0..180 {
+            wait_for(&mut engine, frame);
+        }
+        // Force the forward buffer to fill, evicting frames needed on reversal.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while engine.stream_head_frame.load(Ordering::SeqCst) < 225 {
+            engine.poll_decoded_frames();
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(2));
+        }
+        engine.poll_decoded_frames();
+        assert!(!engine.cache.contains(FrameKey {
+            source_id: clip.id,
+            source_frame: 80
+        }));
+        for frame in (60..179).rev() {
+            wait_for(&mut engine, frame);
+        }
+        for frame in 61..240 {
+            wait_for(&mut engine, frame);
+        }
+    }
+
+    fn test_engine() -> PreviewEngine {
+        let binaries = FfmpegBinaries {
+            ffmpeg_path: PathBuf::from("unused-ffmpeg"),
+            ffprobe_path: PathBuf::from("unused-ffprobe"),
+            ffmpeg_version: String::new(),
+            ffprobe_version: String::new(),
+            vvencapp_path: None,
+            vvencapp_version: None,
+        };
+        PreviewEngine::new(FfmpegProcessDecoder::new(binaries, false), 96)
+    }
+
+    #[test]
+    fn reset_rejects_old_results_even_when_source_ids_are_reused() {
+        let mut engine = test_engine();
+        let (tx, rx) = mpsc::channel();
+        engine.result_rx = rx;
+        let frame = DecodedFrame {
+            source_id: 0,
+            source_frame: 0,
+            pts_us: TimestampUs::ZERO,
+            width: 1,
+            height: 1,
+            rgba: Arc::new(vec![0; 4]),
+        };
+        tx.send((0, frame.clone())).unwrap();
+        engine.reset();
+        assert!(!engine.poll_decoded_frames());
+        assert!(engine.cache.is_empty());
+        tx.send((engine.generation.load(Ordering::SeqCst), frame))
+            .unwrap();
+        assert!(engine.poll_decoded_frames());
+        assert_eq!(engine.cache.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reset_kills_a_blocked_decoder_process() {
+        let mut engine = test_engine();
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        let child = Arc::new(Mutex::new(child));
+        *engine.active_child.lock().unwrap() = Some(Arc::clone(&child));
+        engine.reset();
+        assert!(!child.lock().unwrap().wait().unwrap().success());
+    }
 
     #[test]
     fn test_lru_frame_cache_eviction() {

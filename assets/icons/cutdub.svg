@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <title>CutDub — Split Play</title>
+  <desc>An ivory and mint play symbol separated by a precise cut, on a midnight tile.</desc>
+  <rect x="48" y="48" width="928" height="928" rx="208" fill="#15232D"/>
+  <path d="M302 256 Q288 248 288 264 V760 Q288 776 302 768 L472 670 V354 Z" fill="#F3F6F2"/>
+  <path d="M528 386 V638 Q528 652 540 645 L758 520 Q772 512 758 504 L540 379 Q528 372 528 386Z" fill="#65E0C4"/>
+</svg>

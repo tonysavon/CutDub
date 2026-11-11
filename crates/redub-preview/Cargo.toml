@@ -11,3 +11,6 @@ rodio.workspace = true
 redub-platform.workspace = true
 redub-core.workspace = true
 redub-media.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

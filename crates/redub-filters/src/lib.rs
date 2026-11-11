@@ -543,13 +543,13 @@ impl FilterKind {
                 algorithm,
                 spec_mode,
                 scale_percent,
-                aspect_mode,
+                aspect_mode: _,
             } => match spec_mode {
                 ResizeSpecMode::Percentage => {
                     format!("{scale_percent:.0}% ({})", algorithm.label())
                 }
                 ResizeSpecMode::Dimensions => {
-                    format!("{width}×{height} [{:?}, {}]", aspect_mode, algorithm.label())
+                    format!("{width}×{height} ({})", algorithm.label())
                 }
             },
             Self::Rotate {
@@ -1104,10 +1104,16 @@ impl FilterKind {
     }
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FilterInstance {
     pub id: u64,
     pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub is_open: bool,
     pub kind: FilterKind,
 }
 
@@ -1135,6 +1141,7 @@ impl FilterPipeline {
         self.filters.push(FilterInstance {
             id,
             enabled: true,
+            is_open: true,
             kind,
         });
         id
@@ -2229,5 +2236,38 @@ mod tests {
         assert_eq!(w, 2);
         assert_eq!(h, 4);
         assert_eq!(out.len(), 2 * 4 * 4);
+    }
+
+    #[test]
+    fn test_filter_collapsible_and_summary() {
+        let mut pipe = FilterPipeline::new();
+        let id = pipe.add(FilterKind::new_resize(
+            1920,
+            1080,
+            ScalingAlgorithm::Lanczos,
+        ));
+        assert_eq!(pipe.filters.len(), 1);
+        let instance = &mut pipe.filters[0];
+        assert_eq!(instance.id, id);
+        assert!(instance.enabled);
+        assert!(
+            instance.is_open,
+            "Newly added filter must be open by default"
+        );
+        assert_eq!(instance.kind.summary(), "1920×1080 (Lanczos (Sharp))");
+
+        // User can collapse it
+        instance.is_open = false;
+        assert!(!instance.is_open);
+
+        // Verify backward-compatible JSON deserialization with missing `is_open` defaults to true
+        let legacy_json = r#"{"id":42,"enabled":true,"kind":{"Crop":{"left":10,"top":20,"right":30,"bottom":40}}}"#;
+        let deserialized: FilterInstance =
+            serde_json::from_str(legacy_json).expect("deserialize legacy filter");
+        assert!(
+            deserialized.is_open,
+            "Missing `is_open` should default to true"
+        );
+        assert_eq!(deserialized.kind.summary(), "L:10 T:20 R:30 B:40");
     }
 }

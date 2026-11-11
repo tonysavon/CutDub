@@ -2,6 +2,14 @@ name: Build release archives
 
 on:
   workflow_dispatch:
+    inputs:
+      ref:
+        description: Commit or tag to package
+        required: true
+        default: main
+
+permissions:
+  contents: read
 
 jobs:
   package:
@@ -13,20 +21,38 @@ jobs:
             target: aarch64-apple-darwin
           - os: macos-15-intel
             target: x86_64-apple-darwin
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
           - os: windows-latest
             target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+          shared-key: cutdub-build
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libssl-dev libgtk-3-dev libasound2-dev
       - name: Read project version
         shell: bash
         run: echo "VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)" >> "$GITHUB_ENV"
       - name: Package macOS
         if: runner.os == 'macOS'
         run: ./scripts/package-macos.sh "$VERSION" "${{ matrix.target }}"
+      - name: Package Linux
+        if: runner.os == 'Linux'
+        run: ./scripts/package-linux.sh "$VERSION" "${{ matrix.target }}"
       - name: Package Windows
         if: runner.os == 'Windows'
         shell: pwsh
@@ -38,3 +64,21 @@ jobs:
             releases/${{ env.VERSION }}/*.zip
             releases/${{ env.VERSION }}/*.tar.gz
           if-no-files-found: error
+  checksums:
+    needs: package
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: CutDub-*
+          merge-multiple: true
+          path: dist
+      - name: Generate checksums from final archives
+        working-directory: dist
+        run: |
+          sha256sum *.tar.gz *.zip | sort -k 2 > SHA256SUMS.txt
+          sha256sum --check SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-checksums
+          path: dist/SHA256SUMS.txt

@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use redub_core::{AudioExportMode, EditSegment, Project, TimestampUs};
 use redub_filters::FilterPipeline;
-use redub_media::probe_media_file;
+use redub_media::{probe_media_file, MediaCapabilities};
 use redub_platform::{configure_background_command, FfmpegBinaries};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -166,8 +166,436 @@ pub fn is_lossless_or_pcm_audio_encoder(codec: &str) -> bool {
     )
 }
 
+/// Detailed audio bitrate profile tailored specifically to the chosen audio encoder,
+/// sample rate, and channel configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioBitrateProfile {
+    /// True if the codec is lossless or uncompressed PCM (bitrate not applicable).
+    pub is_lossless: bool,
+    /// Absolute minimum valid/allowed bitrate in kbps for this configuration.
+    pub min_kbps: u32,
+    /// Absolute maximum valid/allowed bitrate in kbps for this configuration.
+    pub max_kbps: u32,
+    /// Recommended default bitrate in kbps.
+    pub default_kbps: u32,
+    /// Sensible discrete preset bitrates to display as quick-select buttons in the UI.
+    pub presets: Vec<u32>,
+    /// Optional advisory warning or notice regarding standard limitations.
+    pub notice: Option<&'static str>,
+}
+
+/// Computes the valid bitrate range, recommended default, presets, and specification notices
+/// for a specific audio codec, target/source sample rate, and channel count.
+pub fn audio_bitrate_profile(
+    codec: &str,
+    sample_rate_hz: Option<u32>,
+    channel_count: u32,
+) -> AudioBitrateProfile {
+    if is_lossless_or_pcm_audio_encoder(codec) {
+        return AudioBitrateProfile {
+            is_lossless: true,
+            min_kbps: 0,
+            max_kbps: 0,
+            default_kbps: 0,
+            presets: Vec::new(),
+            notice: None,
+        };
+    }
+
+    let channels = channel_count.max(1);
+    let sr = sample_rate_hz.unwrap_or(48_000);
+
+    match codec {
+        "libmp3lame" | "mp3" => {
+            let mut notice = None;
+            if channels > 2 {
+                notice = Some("MP3 standard only supports Mono or Stereo (1 or 2 channels). Audio will be downmixed.");
+            }
+            if sr >= 96_000 {
+                notice = Some("MP3 maximum standard sample rate is 48 kHz. Audio will be resampled.");
+            }
+
+            // MPEG-2 Layer 3 applies for low sample rates (<= 24000 Hz)
+            if sr <= 24_000 {
+                if channels == 1 {
+                    AudioBitrateProfile {
+                        is_lossless: false,
+                        min_kbps: 16,
+                        max_kbps: 96,
+                        default_kbps: 48,
+                        presets: vec![24, 32, 48, 64, 80, 96],
+                        notice,
+                    }
+                } else {
+                    AudioBitrateProfile {
+                        is_lossless: false,
+                        min_kbps: 32,
+                        max_kbps: 160,
+                        default_kbps: 96,
+                        presets: vec![48, 64, 96, 128, 160],
+                        notice,
+                    }
+                }
+            } else {
+                // MPEG-1 Layer 3 (32000, 44100, 48000 Hz)
+                if channels == 1 {
+                    AudioBitrateProfile {
+                        is_lossless: false,
+                        min_kbps: 32,
+                        max_kbps: 192,
+                        default_kbps: 96,
+                        presets: vec![48, 64, 96, 128, 160, 192],
+                        notice,
+                    }
+                } else {
+                    AudioBitrateProfile {
+                        is_lossless: false,
+                        min_kbps: 64,
+                        max_kbps: 320,
+                        default_kbps: 192,
+                        presets: vec![96, 128, 160, 192, 224, 256, 320],
+                        notice,
+                    }
+                }
+            }
+        }
+        "ac3" => {
+            let mut notice = None;
+            if sr != 32_000 && sr != 44_100 && sr != 48_000 {
+                notice = Some("ATSC A/52 standard for AC-3 strictly requires 32 kHz, 44.1 kHz, or 48 kHz.");
+            }
+            if channels > 6 {
+                notice = Some("Standard AC-3 supports up to 5.1 channels. For 7.1, choose E-AC-3 (eac3).");
+            }
+
+            if channels <= 1 {
+                AudioBitrateProfile {
+                    is_lossless: false,
+                    min_kbps: 48,
+                    max_kbps: 192,
+                    default_kbps: 96,
+                    presets: vec![64, 96, 128, 160, 192],
+                    notice,
+                }
+            } else if channels <= 2 {
+                AudioBitrateProfile {
+                    is_lossless: false,
+                    min_kbps: 96,
+                    max_kbps: 448,
+                    default_kbps: 192,
+                    presets: vec![128, 160, 192, 224, 256, 320, 384, 448],
+                    notice,
+                }
+            } else if channels <= 5 {
+                AudioBitrateProfile {
+                    is_lossless: false,
+                    min_kbps: 192,
+                    max_kbps: 448,
+                    default_kbps: 320,
+                    presets: vec![192, 256, 320, 384, 448],
+                    notice,
+                }
+            } else {
+                // 5.1 Surround (6ch) or clamped
+                AudioBitrateProfile {
+                    is_lossless: false,
+                    min_kbps: 256,
+                    max_kbps: 640,
+                    default_kbps: 448,
+                    presets: vec![320, 384, 448, 512, 576, 640],
+                    notice,
+                }
+            }
+        }
+        "eac3" => {
+            let mut notice = None;
+            if sr != 32_000 && sr != 44_100 && sr != 48_000 {
+                notice = Some("Dolby Digital Plus (E-AC-3) standard recommends 32 kHz, 44.1 kHz, or 48 kHz.");
+            }
+
+            if channels <= 1 {
+                AudioBitrateProfile {
+                    is_lossless: false,
+                    min_kbps: 32,
+                    max_kbps: 256,
+                    default_kbps: 96,
+                    presets: vec![48, 64, 96, 128, 192],
+                    notice,
+                }
+            } else if channels <= 2 {
+                AudioBitrateProfile {
+                    is_lossless: false,
+                    min_kbps: 96,
+                    max_kbps: 512,
+                    default_kbps: 224,
+                    presets: vec![128, 160, 192, 224, 256, 320, 384],
+                    notice,
+                }
+            } else if channels <= 6 {
+                AudioBitrateProfile {
+                    is_lossless: false,
+                    min_kbps: 256,
+                    max_kbps: 1024,
+                    default_kbps: 448,
+                    presets: vec![320, 384, 448, 512, 640, 768],
+                    notice,
+                }
+            } else {
+                // 7.1 Surround (8ch)
+                AudioBitrateProfile {
+                    is_lossless: false,
+                    min_kbps: 384,
+                    max_kbps: 1536,
+                    default_kbps: 640,
+                    presets: vec![448, 512, 640, 768, 1024, 1536],
+                    notice,
+                }
+            }
+        }
+        "libopus" | "opus" => {
+            if channels <= 1 {
+                AudioBitrateProfile {
+                    is_lossless: false,
+                    min_kbps: 16,
+                    max_kbps: 160,
+                    default_kbps: 64,
+                    presets: vec![24, 32, 48, 64, 80, 96, 128],
+                    notice: None,
+                }
+            } else if channels <= 2 {
+                AudioBitrateProfile {
+                    is_lossless: false,
+                    min_kbps: 32,
+                    max_kbps: 320,
+                    default_kbps: 128,
+                    presets: vec![64, 96, 128, 160, 192, 256],
+                    notice: None,
+                }
+            } else if channels <= 6 {
+                AudioBitrateProfile {
+                    is_lossless: false,
+                    min_kbps: 128,
+                    max_kbps: 512,
+                    default_kbps: 256,
+                    presets: vec![160, 192, 224, 256, 320, 384, 448],
+                    notice: None,
+                }
+            } else {
+                AudioBitrateProfile {
+                    is_lossless: false,
+                    min_kbps: 160,
+                    max_kbps: 640,
+                    default_kbps: 320,
+                    presets: vec![192, 256, 320, 384, 448, 512],
+                    notice: None,
+                }
+            }
+        }
+        "libvorbis" | "vorbis" => {
+            if channels <= 1 {
+                AudioBitrateProfile {
+                    is_lossless: false,
+                    min_kbps: 32,
+                    max_kbps: 160,
+                    default_kbps: 80,
+                    presets: vec![48, 64, 80, 96, 128],
+                    notice: None,
+                }
+            } else if channels <= 2 {
+                AudioBitrateProfile {
+                    is_lossless: false,
+                    min_kbps: 64,
+                    max_kbps: 350,
+                    default_kbps: 160,
+                    presets: vec![96, 128, 160, 192, 224, 256, 320],
+                    notice: None,
+                }
+            } else {
+                AudioBitrateProfile {
+                    is_lossless: false,
+                    min_kbps: 192,
+                    max_kbps: 500,
+                    default_kbps: 320,
+                    presets: vec![224, 256, 320, 384, 448, 500],
+                    notice: None,
+                }
+            }
+        }
+        "aac" | "aac_at" => {
+            if sr <= 24_000 {
+                if channels <= 1 {
+                    AudioBitrateProfile {
+                        is_lossless: false,
+                        min_kbps: 16,
+                        max_kbps: 80,
+                        default_kbps: 48,
+                        presets: vec![24, 32, 48, 64],
+                        notice: None,
+                    }
+                } else if channels <= 2 {
+                    AudioBitrateProfile {
+                        is_lossless: false,
+                        min_kbps: 32,
+                        max_kbps: 128,
+                        default_kbps: 64,
+                        presets: vec![32, 48, 64, 96, 128],
+                        notice: None,
+                    }
+                } else {
+                    AudioBitrateProfile {
+                        is_lossless: false,
+                        min_kbps: 96,
+                        max_kbps: 256,
+                        default_kbps: 160,
+                        presets: vec![96, 128, 160, 192, 256],
+                        notice: None,
+                    }
+                }
+            } else if sr == 32_000 {
+                if channels <= 1 {
+                    AudioBitrateProfile {
+                        is_lossless: false,
+                        min_kbps: 24,
+                        max_kbps: 128,
+                        default_kbps: 64,
+                        presets: vec![32, 48, 64, 96, 128],
+                        notice: None,
+                    }
+                } else if channels <= 2 {
+                    AudioBitrateProfile {
+                        is_lossless: false,
+                        min_kbps: 48,
+                        max_kbps: 224,
+                        default_kbps: 128,
+                        presets: vec![64, 96, 128, 160, 192],
+                        notice: None,
+                    }
+                } else {
+                    AudioBitrateProfile {
+                        is_lossless: false,
+                        min_kbps: 160,
+                        max_kbps: 448,
+                        default_kbps: 256,
+                        presets: vec![192, 256, 320, 384, 448],
+                        notice: None,
+                    }
+                }
+            } else if sr >= 96_000 {
+                if channels <= 1 {
+                    AudioBitrateProfile {
+                        is_lossless: false,
+                        min_kbps: 64,
+                        max_kbps: 256,
+                        default_kbps: 128,
+                        presets: vec![96, 128, 160, 192, 256],
+                        notice: None,
+                    }
+                } else if channels <= 2 {
+                    AudioBitrateProfile {
+                        is_lossless: false,
+                        min_kbps: 128,
+                        max_kbps: 512,
+                        default_kbps: 256,
+                        presets: vec![160, 192, 256, 320, 384, 512],
+                        notice: None,
+                    }
+                } else if channels <= 6 {
+                    AudioBitrateProfile {
+                        is_lossless: false,
+                        min_kbps: 320,
+                        max_kbps: 896,
+                        default_kbps: 512,
+                        presets: vec![384, 448, 512, 640, 768, 896],
+                        notice: None,
+                    }
+                } else {
+                    AudioBitrateProfile {
+                        is_lossless: false,
+                        min_kbps: 384,
+                        max_kbps: 1024,
+                        default_kbps: 640,
+                        presets: vec![448, 512, 640, 768, 896, 1024],
+                        notice: None,
+                    }
+                }
+            } else {
+                // 44.1 kHz & 48 kHz standard AAC
+                if channels <= 1 {
+                    AudioBitrateProfile {
+                        is_lossless: false,
+                        min_kbps: 32,
+                        max_kbps: 192,
+                        default_kbps: 96,
+                        presets: vec![48, 64, 96, 128, 160],
+                        notice: None,
+                    }
+                } else if channels <= 2 {
+                    AudioBitrateProfile {
+                        is_lossless: false,
+                        min_kbps: 64,
+                        max_kbps: 384,
+                        default_kbps: 192,
+                        presets: vec![96, 128, 160, 192, 256, 320],
+                        notice: None,
+                    }
+                } else if channels <= 6 {
+                    AudioBitrateProfile {
+                        is_lossless: false,
+                        min_kbps: 192,
+                        max_kbps: 640,
+                        default_kbps: 384,
+                        presets: vec![256, 320, 384, 448, 512, 640],
+                        notice: None,
+                    }
+                } else {
+                    // 7.1 Surround (8ch)
+                    AudioBitrateProfile {
+                        is_lossless: false,
+                        min_kbps: 256,
+                        max_kbps: 768,
+                        default_kbps: 512,
+                        presets: vec![384, 448, 512, 640, 768],
+                        notice: None,
+                    }
+                }
+            }
+        }
+        _ => {
+            // General fallback
+            if channels <= 1 {
+                AudioBitrateProfile {
+                    is_lossless: false,
+                    min_kbps: 32,
+                    max_kbps: 192,
+                    default_kbps: 96,
+                    presets: vec![48, 64, 96, 128, 160],
+                    notice: None,
+                }
+            } else if channels <= 2 {
+                AudioBitrateProfile {
+                    is_lossless: false,
+                    min_kbps: 64,
+                    max_kbps: 384,
+                    default_kbps: 192,
+                    presets: vec![96, 128, 160, 192, 256, 320],
+                    notice: None,
+                }
+            } else {
+                AudioBitrateProfile {
+                    is_lossless: false,
+                    min_kbps: 192,
+                    max_kbps: 640,
+                    default_kbps: 384,
+                    presets: vec![256, 320, 384, 448, 512, 640],
+                    notice: None,
+                }
+            }
+        }
+    }
+}
+
 /// Complete configuration for an export job or saved preset.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExportSettings {
     pub processing_mode: VideoProcessingMode,
     pub export_selection_only: bool,
@@ -231,6 +659,13 @@ impl Default for ExportSettings {
 }
 
 impl ExportSettings {
+    pub fn encoders_available(&self, caps: &MediaCapabilities) -> bool {
+        (self.processing_mode == VideoProcessingMode::DirectStreamCopy
+            || caps.has_encoder(&self.video_encoder))
+            && (self.audio_processing_mode != AudioProcessingMode::FullProcessing
+                || caps.has_encoder(&self.audio_encoder))
+    }
+
     /// Computes the effective target video bitrate in kbps when `rate_control_mode` is
     /// `TargetBitrateKbps` or `TargetFileSizeMb`. Returns `None` in `Crf` mode.
     pub fn effective_video_bitrate_kbps(
@@ -258,15 +693,48 @@ impl ExportSettings {
             }
         }
     }
-    /// Applies sensible audio bitrate defaults when switching audio encoders.
-    pub fn apply_recommended_defaults_for_audio_encoder(&mut self, new_audio_encoder: &str) {
-        self.audio_encoder = new_audio_encoder.to_string();
-        match new_audio_encoder {
-            "libopus" => self.audio_bitrate_kbps = 160,
-            "aac" | "aac_at" | "libmp3lame" | "libvorbis" => self.audio_bitrate_kbps = 192,
-            "ac3" | "eac3" => self.audio_bitrate_kbps = 384,
-            _ => {}
+    /// Computes the tailored audio bitrate profile for the current encoder, sample rate, and channels.
+    pub fn audio_bitrate_profile(
+        &self,
+        source_channels: Option<u32>,
+        source_sample_rate: Option<u32>,
+    ) -> AudioBitrateProfile {
+        let ch = self.audio_channels.channel_count().or(source_channels).unwrap_or(2);
+        let sr = self.audio_sample_rate.or(source_sample_rate);
+        audio_bitrate_profile(&self.audio_encoder, sr, ch)
+    }
+
+    /// Automatically validates and adjusts `audio_bitrate_kbps` to fit within the valid range
+    /// for the current compression format, sample rate, and channel count.
+    pub fn clamp_audio_bitrate(
+        &mut self,
+        source_channels: Option<u32>,
+        source_sample_rate: Option<u32>,
+    ) {
+        let profile = self.audio_bitrate_profile(source_channels, source_sample_rate);
+        if !profile.is_lossless {
+            self.audio_bitrate_kbps = self.audio_bitrate_kbps.clamp(profile.min_kbps, profile.max_kbps);
         }
+    }
+
+    /// Updates the audio encoder and automatically applies the recommended default bitrate
+    /// tailored to the compression format, sample rate, and channels.
+    pub fn apply_recommended_defaults_for_audio_encoder_with_format(
+        &mut self,
+        new_audio_encoder: &str,
+        source_channels: Option<u32>,
+        source_sample_rate: Option<u32>,
+    ) {
+        self.audio_encoder = new_audio_encoder.to_string();
+        let profile = self.audio_bitrate_profile(source_channels, source_sample_rate);
+        if !profile.is_lossless {
+            self.audio_bitrate_kbps = profile.default_kbps;
+        }
+    }
+
+    /// Applies sensible audio bitrate defaults when switching audio encoders (fallback).
+    pub fn apply_recommended_defaults_for_audio_encoder(&mut self, new_audio_encoder: &str) {
+        self.apply_recommended_defaults_for_audio_encoder_with_format(new_audio_encoder, None, None);
     }
     /// Applies sensible codec-specific CRF and speed preset defaults when the user switches encoders.
     pub fn apply_recommended_defaults_for_encoder(&mut self, new_encoder: &str) {
@@ -345,12 +813,76 @@ impl EncodingPreset {
                 },
             },
             Self {
+                name: "Fast H.264 (CRF 23, MP4)".into(),
+                settings: ExportSettings {
+                    processing_mode: VideoProcessingMode::FullProcessing,
+                    video_encoder: "libx264".into(), crf: 23, encoder_preset: "veryfast".into(),
+                    audio_processing_mode: AudioProcessingMode::FullProcessing,
+                    ..ExportSettings::default()
+                },
+            },
+            Self {
+                name: "H.264 Sharing (4 Mbps + AAC, MP4)".into(),
+                settings: ExportSettings {
+                    processing_mode: VideoProcessingMode::FullProcessing,
+                    video_encoder: "libx264".into(), encoder_preset: "fast".into(),
+                    rate_control_mode: VideoRateControlMode::TargetBitrateKbps,
+                    target_video_bitrate_kbps: 4000,
+                    audio_processing_mode: AudioProcessingMode::FullProcessing,
+                    audio_bitrate_kbps: 128,
+                    ..ExportSettings::default()
+                },
+            },
+            Self {
+                name: "High Quality H.265 / HEVC (CRF 18, MKV)".into(),
+                settings: ExportSettings {
+                    processing_mode: VideoProcessingMode::FullProcessing,
+                    container: ContainerFormat::Mkv,
+                    video_encoder: "libx265".into(),
+                    crf: 18,
+                    encoder_preset: "medium".into(),
+                    ..ExportSettings::default()
+                },
+            },
+            Self {
                 name: "Compact H.265 / HEVC (CRF 22, MKV)".to_string(),
                 settings: ExportSettings {
                     processing_mode: VideoProcessingMode::FullProcessing,
                     container: ContainerFormat::Mkv,
                     video_encoder: "libx265".to_string(),
                     crf: 22,
+                    encoder_preset: "medium".to_string(),
+                    ..ExportSettings::default()
+                },
+            },
+            Self {
+                name: "High Quality AV1 (CRF 24, MKV)".into(),
+                settings: ExportSettings {
+                    processing_mode: VideoProcessingMode::FullProcessing,
+                    container: ContainerFormat::Mkv, video_encoder: "libsvtav1".into(),
+                    crf: 24, encoder_preset: "slow".into(),
+                    ..ExportSettings::default()
+                },
+            },
+            Self {
+                name: "Compact AV1 (CRF 32, MKV)".into(),
+                settings: ExportSettings {
+                    processing_mode: VideoProcessingMode::FullProcessing,
+                    container: ContainerFormat::Mkv, video_encoder: "libsvtav1".into(),
+                    crf: 32, encoder_preset: "fast".into(),
+                    ..ExportSettings::default()
+                },
+            },
+            Self {
+                name: "WebM AV1 (CRF 28 + Opus)".to_string(),
+                settings: ExportSettings {
+                    processing_mode: VideoProcessingMode::FullProcessing,
+                    container: ContainerFormat::Webm,
+                    video_encoder: "libsvtav1".to_string(),
+                    audio_processing_mode: AudioProcessingMode::FullProcessing,
+                    audio_encoder: "libopus".to_string(),
+                    audio_bitrate_kbps: 128,
+                    crf: 28,
                     encoder_preset: "medium".to_string(),
                     ..ExportSettings::default()
                 },
@@ -367,28 +899,48 @@ impl EncodingPreset {
                 },
             },
             Self {
-                name: "WebM VP9 (CRF 28)".to_string(),
+                name: "Lossless Archive (FFV1 + FLAC, MKV)".into(),
                 settings: ExportSettings {
                     processing_mode: VideoProcessingMode::FullProcessing,
-                    container: ContainerFormat::Webm,
-                    video_encoder: "libvpx-vp9".to_string(),
-                    crf: 28,
-                    encoder_preset: "medium".to_string(),
+                    container: ContainerFormat::Mkv, video_encoder: "ffv1".into(),
+                    audio_processing_mode: AudioProcessingMode::FullProcessing,
+                    audio_encoder: "flac".into(),
                     ..ExportSettings::default()
                 },
             },
         ]
     }
 
+    /// Resolve built-in AV1 templates to an installed implementation, and hide
+    /// presets whose required video/audio encoder is unavailable.
+    pub fn available_with(&self, caps: &MediaCapabilities) -> Option<Self> {
+        let mut preset = self.clone();
+        if matches!(preset.name.as_str(), "WebM AV1 (CRF 28 + Opus)"
+            | "High Quality AV1 (CRF 24, MKV)" | "Compact AV1 (CRF 32, MKV)")
+            && preset.settings.video_encoder == "libsvtav1"
+            && !caps.has_encoder("libsvtav1") && caps.has_encoder("libaom-av1") {
+            preset.settings.video_encoder = "libaom-av1".into();
+        }
+        preset.settings.encoders_available(caps).then_some(preset)
+    }
+
     pub fn load_all(presets_file: &Path) -> Vec<Self> {
+        let mut presets = Self::built_in_presets();
         if let Ok(bytes) = fs::read(presets_file) {
-            if let Ok(list) = serde_json::from_slice::<Vec<Self>>(&bytes) {
-                if !list.is_empty() {
-                    return list;
+            if let Ok(saved) = serde_json::from_slice::<Vec<Self>>(&bytes) {
+                for preset in saved {
+                    // Retire the old bundled VP9 template, preserving custom VP9 presets.
+                    if preset.name == "WebM VP9 (CRF 28)"
+                        && preset.settings.video_encoder == "libvpx-vp9" { continue; }
+                    if let Some(existing) = presets.iter_mut().find(|p| p.name == preset.name) {
+                        *existing = preset;
+                    } else {
+                        presets.push(preset);
+                    }
                 }
             }
         }
-        Self::built_in_presets()
+        presets
     }
 
     pub fn save_all(presets_file: &Path, presets: &[Self]) -> Result<(), std::io::Error> {
@@ -2219,6 +2771,75 @@ mod tests {
     use redub_media::{generate_synthetic_video, probe_media_file};
     use tempfile::TempDir;
 
+    fn capabilities(names: &[&str]) -> MediaCapabilities {
+        MediaCapabilities {
+            encoder_names: names.iter().map(|name| name.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn presets_require_installed_encoders_and_av1_can_use_aom() {
+        let presets = EncodingPreset::built_in_presets();
+        assert!(presets.len() >= 12);
+        assert!(!presets.iter().any(|p| p.settings.video_encoder == "libvpx-vp9"));
+        let none = MediaCapabilities::default();
+        assert_eq!(presets.iter().filter(|p| p.available_with(&none).is_some()).count(), 2);
+        let webm = presets.iter().find(|p| p.name.starts_with("WebM AV1")).unwrap();
+        assert!(webm.available_with(&capabilities(&["libsvtav1"])).is_none());
+        let available = webm.available_with(&capabilities(&["libaom-av1", "libopus"])).unwrap();
+        assert_eq!(available.settings.video_encoder, "libaom-av1");
+        assert_eq!(available.settings.audio_processing_mode, AudioProcessingMode::FullProcessing);
+        let vvc = presets.iter().find(|p| p.settings.video_encoder == "libvvenc").unwrap();
+        assert!(vvc.available_with(&none).is_none());
+        assert!(vvc.available_with(&capabilities(&["libvvenc"])).is_some());
+    }
+
+    #[test]
+    fn saved_presets_get_new_templates_without_losing_custom_entries() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("presets.json");
+        let legacy = EncodingPreset {
+            name: "WebM VP9 (CRF 28)".into(),
+            settings: ExportSettings { video_encoder: "libvpx-vp9".into(), ..Default::default() },
+        };
+        let custom = EncodingPreset { name: "My VP9 Settings".into(), ..legacy.clone() };
+        EncodingPreset::save_all(&path, &[legacy, custom]).unwrap();
+        let loaded = EncodingPreset::load_all(&path);
+        assert!(!loaded.iter().any(|p| p.name == "WebM VP9 (CRF 28)"));
+        assert!(loaded.iter().any(|p| p.name == "My VP9 Settings"));
+        assert!(loaded.iter().any(|p| p.name.starts_with("WebM AV1")));
+        assert_eq!(loaded.len(), EncodingPreset::built_in_presets().len() + 1);
+        EncodingPreset::save_all(&path, &loaded).unwrap();
+        assert_eq!(EncodingPreset::load_all(&path).len(), loaded.len());
+    }
+
+    #[test]
+    fn av1_webm_template_exports_with_opus_when_installed() {
+        let bins = FfmpegBinaries::discover(None, None).expect("FFmpeg must be installed");
+        let caps = MediaCapabilities::detect(&bins);
+        let preset = EncodingPreset::built_in_presets().into_iter()
+            .find(|p| p.name.starts_with("WebM AV1")).unwrap();
+        let Some(preset) = preset.available_with(&caps) else { return; };
+        let tmp = TempDir::new().unwrap();
+        let input = tmp.path().join("input.mp4");
+        generate_synthetic_video(&bins, &input, 128, 96, 10, 0.5, 5).unwrap();
+        let project = Project::from_primary_source(probe_media_file(&bins, &input, true).unwrap());
+        let output = tmp.path().join("av1.webm");
+        let handle = start_export_job(bins.clone(), project, FilterPipeline::new(),
+            preset.settings, output.clone()).unwrap();
+        loop {
+            match handle.receiver.recv_timeout(Duration::from_secs(30)).unwrap() {
+                ExportEvent::Completed { .. } => break,
+                ExportEvent::Failed(error) => panic!("AV1 template failed: {error}"),
+                _ => {}
+            }
+        }
+        let clip = probe_media_file(&bins, &output, true).unwrap();
+        assert_eq!(clip.video_codec, "av1");
+        assert_eq!(clip.audio_streams[0].codec_name, "opus");
+    }
+
     #[test]
     fn test_direct_stream_copy_and_full_processing_exports() {
         let bins = FfmpegBinaries::discover(None, None).expect("FFmpeg must be installed");
@@ -2413,5 +3034,79 @@ mod tests {
             assert_eq!(vvc_probed.height, 240);
             assert_eq!(vvc_probed.timing.total_frames(), 50);
         }
+    }
+
+    #[test]
+    fn test_audio_bitrate_profiles_by_format_samplerate_and_channels() {
+        // 1. Lossless codecs
+        let flac_prof = audio_bitrate_profile("flac", Some(48_000), 2);
+        assert!(flac_prof.is_lossless);
+        assert_eq!(flac_prof.max_kbps, 0);
+
+        // 2. MP3 standard stereo (48 kHz, 2ch) vs low-sample rate (24 kHz) vs mono
+        let mp3_stereo = audio_bitrate_profile("libmp3lame", Some(48_000), 2);
+        assert!(!mp3_stereo.is_lossless);
+        assert_eq!(mp3_stereo.min_kbps, 64);
+        assert_eq!(mp3_stereo.max_kbps, 320);
+        assert_eq!(mp3_stereo.default_kbps, 192);
+        assert!(mp3_stereo.presets.contains(&320));
+
+        let mp3_low_sr = audio_bitrate_profile("libmp3lame", Some(22_050), 2);
+        assert_eq!(mp3_low_sr.max_kbps, 160, "MPEG-2 Layer 3 max bitrate must be 160 kbps");
+
+        let mp3_mono = audio_bitrate_profile("libmp3lame", Some(44_100), 1);
+        assert_eq!(mp3_mono.default_kbps, 96);
+        assert_eq!(mp3_mono.max_kbps, 192);
+
+        let mp3_surround = audio_bitrate_profile("libmp3lame", Some(48_000), 6);
+        assert!(mp3_surround.notice.is_some(), "MP3 with >2 channels must provide a notice");
+
+        // 3. AC-3 stereo vs 5.1
+        let ac3_stereo = audio_bitrate_profile("ac3", Some(48_000), 2);
+        assert_eq!(ac3_stereo.default_kbps, 192);
+        assert_eq!(ac3_stereo.max_kbps, 448);
+
+        let ac3_51 = audio_bitrate_profile("ac3", Some(48_000), 6);
+        assert_eq!(ac3_51.default_kbps, 448);
+        assert_eq!(ac3_51.max_kbps, 640);
+        assert!(ac3_51.presets.contains(&640));
+
+        let ac3_invalid_sr = audio_bitrate_profile("ac3", Some(96_000), 2);
+        assert!(ac3_invalid_sr.notice.is_some(), "AC-3 at 96 kHz must give an advisory notice");
+
+        // 4. E-AC-3 7.1
+        let eac3_71 = audio_bitrate_profile("eac3", Some(48_000), 8);
+        assert_eq!(eac3_71.max_kbps, 1536);
+        assert_eq!(eac3_71.default_kbps, 640);
+
+        // 5. Opus mono vs stereo vs 5.1
+        let opus_mono = audio_bitrate_profile("libopus", Some(48_000), 1);
+        assert_eq!(opus_mono.default_kbps, 64);
+        assert_eq!(opus_mono.max_kbps, 160);
+
+        let opus_stereo = audio_bitrate_profile("libopus", Some(48_000), 2);
+        assert_eq!(opus_stereo.default_kbps, 128);
+        assert_eq!(opus_stereo.max_kbps, 320);
+
+        let opus_51 = audio_bitrate_profile("libopus", Some(48_000), 6);
+        assert_eq!(opus_51.default_kbps, 256);
+        assert_eq!(opus_51.max_kbps, 512);
+
+        // 6. AAC low sample rate vs high sample rate
+        let aac_24k_mono = audio_bitrate_profile("aac", Some(24_000), 1);
+        assert_eq!(aac_24k_mono.max_kbps, 80);
+
+        let aac_96k_stereo = audio_bitrate_profile("aac", Some(96_000), 2);
+        assert_eq!(aac_96k_stereo.max_kbps, 512);
+        assert_eq!(aac_96k_stereo.default_kbps, 256);
+
+        // 7. Verify ExportSettings clamping
+        let mut settings = ExportSettings::default();
+        settings.audio_encoder = "libmp3lame".into();
+        settings.audio_sample_rate = Some(24_000);
+        settings.audio_channels = AudioChannelMode::Stereo;
+        settings.audio_bitrate_kbps = 320; // 320 is invalid for 24kHz MP3!
+        settings.clamp_audio_bitrate(None, None);
+        assert_eq!(settings.audio_bitrate_kbps, 160, "Must clamp to 160 kbps for 24kHz MP3");
     }
 }

@@ -9,7 +9,7 @@ use std::fs;
 use std::io::Read;
 use std::path::Path;
 use std::process::{Child, ChildStdout, Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use redub_core::{
     AudioStreamInfo, AudioWaveform, FrameEntry, FrameTimingMap, Rational, SourceClip,
@@ -61,7 +61,7 @@ impl MediaCapabilities {
         let mut hw_cmd = Command::new(&binaries.ffmpeg_path);
         hw_cmd.args(["-hide_banner", "-hwaccels"]);
         configure_background_command(&mut hw_cmd);
-        if let Ok(output) = hw_cmd.output() {
+        if let Some(output) = hw_cmd.output().ok().filter(|output| output.status.success()) {
             let stdout = String::from_utf8_lossy(&output.stdout);
             for line in stdout.lines() {
                 let trimmed = line.trim();
@@ -75,7 +75,7 @@ impl MediaCapabilities {
         let mut enc_cmd = Command::new(&binaries.ffmpeg_path);
         enc_cmd.args(["-hide_banner", "-encoders"]);
         configure_background_command(&mut enc_cmd);
-        if let Ok(output) = enc_cmd.output() {
+        if let Some(output) = enc_cmd.output().ok().filter(|output| output.status.success()) {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let mut in_table = false;
             for line in stdout.lines() {
@@ -127,7 +127,9 @@ impl MediaCapabilities {
         }
 
         // 3. Detect external VVenC (libvvenc / vvencapp) H.266/VVC encoder if installed on the system
-        if binaries.vvencapp_path.is_some() && !caps.encoder_names.contains("libvvenc") {
+        if binaries.vvencapp_path.as_deref().is_some_and(|path|
+            redub_platform::query_version_flag(path, "--version").is_ok())
+            && !caps.encoder_names.contains("libvvenc") {
             let desc = binaries
                 .vvencapp_version
                 .as_deref()
@@ -838,7 +840,7 @@ pub trait VideoFrameDecoder: Send + Sync {
 /// A persistent, streaming FFmpeg decoder process that yields consecutive RGBA frames
 /// one by one without re-opening the media file or re-seeking between bursts.
 pub struct ContinuousFrameStream {
-    child: Child,
+    child: Arc<Mutex<Child>>,
     stdout: ChildStdout,
     pub clip: Arc<SourceClip>,
     pub next_frame: u64,
@@ -874,9 +876,16 @@ impl ContinuousFrameStream {
         }
     }
 
+    /// A handle that can kill the process while the decoder is blocked reading stdout.
+    pub fn cancellation_handle(&self) -> Arc<Mutex<Child>> {
+        Arc::clone(&self.child)
+    }
+
     pub fn stop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -967,7 +976,7 @@ impl FfmpegProcessDecoder {
             .ok_or_else(|| MediaError::DecodeFailed("Missing stdout pipe".into()))?;
 
         Ok(ContinuousFrameStream {
-            child,
+            child: Arc::new(Mutex::new(child)),
             stdout,
             clip,
             next_frame: clamped_start,
@@ -1221,6 +1230,31 @@ pub fn generate_synthetic_video(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_or_broken_external_vvc_is_not_advertised() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let ffmpeg = tmp.path().join("ffmpeg");
+        fs::write(&ffmpeg, "#!/bin/sh\nprintf '%s\\n' '------' ' V..... libx264 H264'\n").unwrap();
+        fs::set_permissions(&ffmpeg, fs::Permissions::from_mode(0o755)).unwrap();
+        let external = tmp.path().join("vvencapp");
+        fs::write(&external, "#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(&external, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut bins = FfmpegBinaries {
+            ffmpeg_path: ffmpeg, ffprobe_path: external.clone(),
+            ffmpeg_version: String::new(), ffprobe_version: String::new(),
+            vvencapp_path: Some(external.clone()), vvencapp_version: None,
+        };
+        let broken = MediaCapabilities::detect(&bins);
+        assert!(broken.has_encoder("libx264"));
+        assert!(!broken.has_encoder("libvvenc"));
+        fs::write(&external, "#!/bin/sh\nprintf 'VVenC test version\\n'\n").unwrap();
+        assert!(MediaCapabilities::detect(&bins).has_encoder("libvvenc"));
+        bins.vvencapp_path = None;
+        assert!(!MediaCapabilities::detect(&bins).has_encoder("libvvenc"));
+    }
 
     #[test]
     fn test_capabilities_probe_and_decode() {

@@ -120,6 +120,10 @@ fn main() -> ExitCode {
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
+            .with_app_id("cutdub")
+            .with_icon(eframe::icon_data::from_png_bytes(
+                include_bytes!("../../../assets/icons/cutdub-256.png"),
+            ).expect("The bundled CutDub icon must be valid PNG"))
             .with_title("CutDub — Precision Video Processor")
             .with_inner_size([1440.0, 880.0])
             .with_min_inner_size([960.0, 620.0])

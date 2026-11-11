@@ -5,7 +5,7 @@
   <a href="https://github.com/tonysavon/CutDub/releases"><img src="https://img.shields.io/github/v/release/tonysavon/CutDub?include_prereleases&color=blue" alt="Latest Release" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg" alt="License: GPL-3.0" /></a>
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg" alt="Platform: macOS | Linux | Windows" />
-  <img src="https://img.shields.io/badge/rust-1.80%2B-orange.svg" alt="Rust 1.80+" />
+  <img src="https://img.shields.io/badge/rust-stable-orange.svg" alt="Rust stable" />
 </p>
 
 **CutDub** (also known as **ReDub**) is a modern, open-source, cross-platform successor to **VirtualDub2**, written in Rust with a hardware-accelerated `egui` / `eframe` (`wgpu`) desktop interface and powered by **FFmpeg**.
@@ -20,21 +20,21 @@ Unlike heavy non-linear editing suites (Premiere Pro, DaVinci Resolve), CutDub i
 
 ---
 
-## Downloads (v0.1.0)
+## Downloads (v0.1.1)
 
-Pre-built standalone releases are available on the [**GitHub Releases page**](https://github.com/tonysavon/CutDub/releases/tag/v0.1.0):
+Pre-built standalone releases are available on the [**GitHub Releases page**](https://github.com/tonysavon/CutDub/releases/tag/v0.1.1):
 
 | Platform | Architecture | Package |
 | :--- | :--- | :--- |
-| **macOS** | Apple Silicon (`arm64`) | [**`CutDub-0.1.0-macos-arm64.tar.gz`**](https://github.com/tonysavon/CutDub/releases) |
-| **macOS** | Intel (`x86_64`) | [**`CutDub-0.1.0-macos-x86_64.tar.gz`**](https://github.com/tonysavon/CutDub/releases) |
-| **Windows** | 64-bit (`x86_64`) | [**`CutDub-0.1.0-windows-x86_64.zip`**](https://github.com/tonysavon/CutDub/releases) |
-| **Linux** | 64-bit (`x86_64`) | [**`CutDub-0.1.0-linux-x86_64.tar.gz`**](https://github.com/tonysavon/CutDub/releases) |
+| **macOS** | Apple Silicon (`arm64`) | [**`CutDub-0.1.1-macos-arm64.tar.gz`**](https://github.com/tonysavon/CutDub/releases/download/v0.1.1/CutDub-0.1.1-macos-arm64.tar.gz) |
+| **macOS** | Intel (`x86_64`) | [**`CutDub-0.1.1-macos-x86_64.tar.gz`**](https://github.com/tonysavon/CutDub/releases/download/v0.1.1/CutDub-0.1.1-macos-x86_64.tar.gz) |
+| **Windows** | 64-bit (`x86_64`) | [**`CutDub-0.1.1-windows-x86_64.zip`**](https://github.com/tonysavon/CutDub/releases/download/v0.1.1/CutDub-0.1.1-windows-x86_64.zip) |
+| **Linux** | 64-bit (`x86_64`) | [**`CutDub-0.1.1-linux-x86_64.tar.gz`**](https://github.com/tonysavon/CutDub/releases/download/v0.1.1/CutDub-0.1.1-linux-x86_64.tar.gz) |
 
 > [!NOTE]
 > - CutDub requires **FFmpeg** and **ffprobe** installed on your system or in your `PATH`.
-> - Checksum verification hashes are provided in [`releases/0.1.0/SHA256SUMS.txt`](releases/0.1.0/SHA256SUMS.txt).
-> - On macOS, because release builds are self-signed, remove the quarantine flag if prompted:
+> - Checksum verification hashes are provided in [`SHA256SUMS.txt`](https://github.com/tonysavon/CutDub/releases/download/v0.1.1/SHA256SUMS.txt).
+> - On macOS, release builds use an ad-hoc signature and are not notarized. After verifying the download, you may need to remove its quarantine flag:
 >   ```bash
 >   xattr -cr /path/to/CutDub.app
 >   ```
@@ -44,11 +44,11 @@ Pre-built standalone releases are available on the [**GitHub Releases page**](ht
 ## Key Features
 
 - **Frame-Accurate Navigation & Scrubbing**:
-  Sub-millisecond frame seeking across Constant Frame Rate (CFR) and Variable Frame Rate (VFR) streams using 64-bit microsecond timestamps (`TimestampUs`) and FFmpeg rational time bases. Explicit identification of Keyframes (`[K]`), Intra/Predicted frames (`[I/P]`), and Bi-directional frames.
+  Frame navigation across Constant Frame Rate (CFR) and Variable Frame Rate (VFR) streams using 64-bit microsecond timestamps (`TimestampUs`) and FFmpeg rational time bases. Explicit identification of Keyframes (`[K]`), Intra/Predicted frames (`[I/P]`), and Bi-directional frames.
 - **Lossless Direct Stream Copy (`-c:v copy`)**:
   Instantaneous lossless export without quality loss or re-encoding. Automatically validates GOP structure and keyframe boundaries, warning you if an in-point falls on a delta frame to avoid corrupt lead-in artifacts.
 - **Smart Cut / Smart Rendering (`SmartCopy`)**:
-  Frame-accurate cutting without re-encoding the entire video! Only re-encodes the tiny partial lead-in GOP up to the next keyframe, then copies the rest of the stream losslessly at multi-gigabyte/second disk speed.
+  Frame-accurate cutting without re-encoding the entire video! Only re-encodes the tiny partial lead-in GOP up to the next keyframe, then copies the rest of the stream without re-encoding. Export speed depends on the media and storage.
 - **Real-Time Video Filter Pipeline**:
   Composable, reorderable filters executing live in the UI and compiling directly to FFmpeg `-vf` filtergraphs:
   - **Resize / Scale**: Lanczos (Sharp), Bicubic, Bilinear, Spline, with 4K, 1440p, 1080p, 720p, 480p, 9:16 vertical, and 1:1 square presets with aspect ratio preservation.
@@ -61,7 +61,7 @@ Pre-built standalone releases are available on the [**GitHub Releases page**](ht
 - **Live Scopes & Telemetry**:
   Real-time RGB and Luma histogram scope with live shadow/highlight clipping percentage detection and average scene luminance indicators.
 - **Continuous Streaming Playback & Live Audio**:
-  Persistent backpressure-paced FFmpeg streaming pipe paired with high-performance `rodio` audio output for stutter-free playback of 4K/UHD files directly from external storage.
+  Persistent backpressure-paced FFmpeg streaming pipe paired with high-performance `rodio` audio output for buffered playback, including files on external storage. Performance depends on the codec, filters, hardware, and storage.
 - **Non-Destructive Edit Decision List (EDL)**:
   Mark In / Mark Out selection, Trim to Selection, Delete Range, Append Segments, Timeline Bookmarks (`Mark`), and infinite Undo/Redo (`Cmd/Ctrl+Z` / `Cmd/Ctrl+Y`).
 - **Multi-Track Audio & Subtitle Stream Control**:
@@ -97,10 +97,48 @@ CutDub is designed for rapid keyboard-driven editing:
 
 ---
 
+## Export Presets
+
+The preset menu shows templates whose required encoders are detected in the installed
+FFmpeg build. VVC requires FFmpeg's native `libvvenc` encoder or a working external
+`vvencapp`; a missing or broken external executable is not advertised as available.
+
+Templates include stream copy, smart cut, high-quality and fast H.264, 4 Mbps H.264
+sharing, high-quality and compact HEVC, VVC, AV1 WebM with Opus audio, high-quality and compact AV1
+in MKV, and lossless FFV1/FLAC archival. The selector shows the loaded preset name and displays **Custom** when its settings are changed. AV1 templates prefer `libsvtav1` and fall
+back to `libaom-av1` when available. The bundled VP9 WebM template has been replaced
+with AV1. Custom saved presets remain intact, and newly added templates are merged
+into existing preset collections.
+
+---
+
+## Navigation Performance Diagnostics
+
+Paused navigation keeps a rolling frame buffer and prepares up to three upcoming
+10-frame or keyframe targets in the last keyboard navigation direction. Speculative
+keyframe decoding runs after the rolling buffer is full and is cancelled by a new seek.
+Predictions stay within the current source clip; edits spanning other sources may still
+require an uncached seek.
+
+Open **Tools → FFmpeg Capabilities & Cache Telemetry...** for the latest preview
+preparation time, split into frame wait, filters, histogram, and texture preparation.
+Keyboard measurements start when the input is handled. These are CPU timings:
+frame wait includes polling, and texture preparation includes conversion and queueing,
+not GPU upload or screen presentation.
+
+To log individual paused-navigation samples, including whether the frame was already
+cached on its first request:
+
+```bash
+RUST_LOG=redub_app=debug cargo run --release --bin cutdub
+```
+
+---
+
 ## Prerequisites & Building from Source
 
 ### Prerequisites
-1. **Rust stable toolchain** (`1.80+`, via [rustup](https://rustup.rs/))
+1. **Rust stable toolchain** (stable, via [rustup](https://rustup.rs/))
 2. **FFmpeg & ffprobe** (`ffmpeg` and `ffprobe` in `PATH` or configured via `CUTDUB_FFMPEG` / `CUTDUB_FFPROBE`)
 
 ### macOS (Apple Silicon & Intel)
@@ -123,7 +161,7 @@ cargo test --workspace
 sudo apt-get update
 sudo apt-get install -y ffmpeg build-essential pkg-config \
     libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-    libxkbcommon-dev libssl-dev libgtk-3-dev
+    libxkbcommon-dev libssl-dev libgtk-3-dev libasound2-dev
 
 # Build and run
 cargo run --release --bin cutdub
@@ -177,15 +215,15 @@ To produce standalone release bundles:
 
 - **macOS (`CutDub.app` bundle + `.tar.gz`):**
   ```bash
-  ./scripts/package-macos.sh 0.1.0
+  ./scripts/package-macos.sh 0.1.1
   ```
 - **Linux (`.desktop` + portable `.tar.gz`):**
   ```bash
-  ./scripts/package-linux.sh 0.1.0
+  ./scripts/package-linux.sh 0.1.1
   ```
 - **Windows (portable `.zip`):**
   ```powershell
-  powershell -ExecutionPolicy Bypass -File scripts\package-windows.ps1 -Version 0.1.0
+  powershell -ExecutionPolicy Bypass -File scripts\package-windows.ps1 -Version 0.1.1
   ```
 
 Output archives are created in `releases/<version>/`.

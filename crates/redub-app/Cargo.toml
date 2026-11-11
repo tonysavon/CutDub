@@ -24,3 +24,6 @@ redub-media.workspace = true
 redub-filters.workspace = true
 redub-preview.workspace = true
 redub-export.workspace = true
+
+[build-dependencies]
+winresource = "0.1.34"

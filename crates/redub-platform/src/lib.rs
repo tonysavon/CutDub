@@ -70,6 +70,10 @@ impl FfmpegBinaries {
         let vvencapp_version = vvencapp_path
             .as_deref()
             .and_then(|p| query_version_flag(p, "--version").ok());
+        // A file on PATH can have missing shared libraries or be non-functional.
+        if vvencapp_version.is_none() {
+            vvencapp_path = None;
+        }
 
         info!(
             ffmpeg = %ffmpeg_path.display(),

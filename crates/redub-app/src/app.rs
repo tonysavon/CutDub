@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use egui::{
     Align, Color32, ColorImage, Context, CornerRadius, FontId, Key, Layout, Margin, Modifiers,
@@ -28,8 +28,18 @@ use redub_media::{
     DetectedSceneMarker, FfmpegProcessDecoder, MediaCapabilities, SceneMarkerKind,
 };
 use redub_platform::{AppPaths, AppSettings, FfmpegBinaries};
-use redub_preview::{AudioPreviewPlayer, PlaybackClock, PreviewEngine};
+use redub_preview::{AudioPreviewPlayer, NavigationHint, PlaybackClock, PreviewEngine};
 use tracing::{error, info};
+
+#[derive(Default)]
+struct PreviewLatency {
+    total_ms: f64,
+    wait_ms: f64,
+    filters_ms: f64,
+    histogram_ms: f64,
+    texture_ms: f64,
+    cached: bool,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreviewLayoutMode {
@@ -79,6 +89,7 @@ pub struct CutDubApp {
     paths: AppPaths,
     settings: AppSettings,
     binaries: Option<FfmpegBinaries>,
+    toolchain_error: Option<String>,
     capabilities: MediaCapabilities,
 
     project: Project,
@@ -86,6 +97,7 @@ pub struct CutDubApp {
     export_settings: ExportSettings,
     presets: Vec<EncodingPreset>,
     new_preset_name: String,
+    selected_preset: Option<(String, ExportSettings)>,
 
     preview_engine: Option<PreviewEngine>,
     playback: PlaybackClock,
@@ -94,6 +106,9 @@ pub struct CutDubApp {
     source_texture: Option<TextureHandle>,
     output_texture: Option<TextureHandle>,
     displayed_frame_key: Option<(usize, u64, u64)>, // (source_id, source_frame, filter_hash)
+    pending_preview: Option<((usize, u64), Instant)>,
+    pending_preview_cache_hit: Option<bool>,
+    preview_latency: Option<PreviewLatency>,
     current_histogram: Option<FrameHistogram>,
     show_histogram: bool,
 
@@ -153,11 +168,13 @@ impl CutDubApp {
         let settings = AppSettings::load(&paths);
         let presets = EncodingPreset::load_all(&paths.presets_file);
 
-        let binaries = FfmpegBinaries::discover(
+        let discovery = FfmpegBinaries::discover(
             settings.custom_ffmpeg_path.as_deref(),
             settings.custom_ffprobe_path.as_deref(),
-        )
-        .ok();
+        );
+        let toolchain_error = discovery.as_ref().err().map(ToString::to_string);
+        let show_ffmpeg_dialog = toolchain_error.is_some();
+        let binaries = discovery.ok();
 
         let capabilities = binaries
             .as_ref()
@@ -179,18 +196,23 @@ impl CutDubApp {
             paths,
             settings,
             binaries,
+            toolchain_error,
             capabilities,
             project: Project::new(),
             filters: FilterPipeline::new(),
             export_settings,
             presets,
             new_preset_name: String::new(),
+            selected_preset: None,
             preview_engine,
             playback: PlaybackClock::default(),
             audio_player: AudioPreviewPlayer::new(),
             source_texture: None,
             output_texture: None,
             displayed_frame_key: None,
+            pending_preview: None,
+            pending_preview_cache_hit: None,
+            preview_latency: None,
             current_histogram: None,
             show_histogram: true,
             preview_layout: PreviewLayoutMode::DualSideBySide,
@@ -201,7 +223,7 @@ impl CutDubApp {
             goto_frame_input: String::new(),
             goto_time_input: String::new(),
             show_shortcuts_dialog: false,
-            show_ffmpeg_dialog: false,
+            show_ffmpeg_dialog,
             show_about_dialog: false,
             timing_scan_rx: None,
             is_scanning_timing: false,
@@ -244,7 +266,9 @@ impl CutDubApp {
 
     fn open_media_file(&mut self, path: PathBuf) {
         let Some(bins) = self.binaries.clone() else {
-            self.set_status("FFmpeg / ffprobe binaries are not configured.", true);
+            self.show_ffmpeg_dialog = true;
+            self.set_status(self.toolchain_error.clone().unwrap_or_else(||
+                "FFmpeg and ffprobe are required to open videos.".into()), true);
             return;
         };
 
@@ -259,9 +283,12 @@ impl CutDubApp {
                 let file_size = clip.file_size_bytes;
                 self.project = Project::from_primary_source(clip);
                 if let Some(engine) = &mut self.preview_engine {
-                    engine.cache.clear();
+                    engine.reset();
                 }
                 self.displayed_frame_key = None;
+                self.pending_preview = None;
+                self.preview_latency = None;
+                self.pending_preview_cache_hit = None;
                 self.has_full_timing_index = false;
                 self.probed_kf_window = None;
                 self.local_kf_rx = None;
@@ -407,6 +434,10 @@ impl CutDubApp {
     }
 
     fn trigger_export_dialog(&mut self) {
+        if !self.export_settings.encoders_available(&self.capabilities) {
+            self.set_status("The selected encoder is unavailable. Choose an installed encoder or an available preset.", true);
+            return;
+        }
         if !self.project.is_loaded() {
             self.set_status("Load a video file before exporting.", true);
             return;
@@ -754,12 +785,16 @@ impl CutDubApp {
         let Some(resolved) = self.project.resolve_frame(self.project.current_frame) else {
             return;
         };
-        let Some(clip) = self.project.source_by_id(resolved.source_id).cloned() else {
-            return;
-        };
         let filter_sig = self.filter_pipeline_signature();
         let target_key = (resolved.source_id, resolved.source_frame, filter_sig);
 
+        let source_key = (resolved.source_id, resolved.source_frame);
+        if self.displayed_frame_key != Some(target_key)
+            && self.pending_preview.as_ref().map(|(key, _)| *key) != Some(source_key)
+        {
+            self.pending_preview = Some((source_key, Instant::now()));
+            self.pending_preview_cache_hit = None;
+        }
         let Some(engine) = &mut self.preview_engine else {
             return;
         };
@@ -774,10 +809,24 @@ impl CutDubApp {
             return;
         }
 
+        let Some(clip) = self.project.source_by_id(resolved.source_id) else {
+            return;
+        };
+        let cached = engine.cache.contains(redub_preview::FrameKey {
+            source_id: clip.id, source_frame: resolved.source_frame,
+        });
+        let cached = *self.pending_preview_cache_hit.get_or_insert(cached);
         if let Some(decoded) =
-            engine.request_frame(&clip, resolved.source_frame, self.playback.is_playing)
+            engine.request_frame(clip, resolved.source_frame, self.playback.is_playing)
         {
             if self.displayed_frame_key != Some(target_key) {
+                let requested_at = self.pending_preview.map(|(_, at)| at).unwrap_or_else(Instant::now);
+                let mut sample = PreviewLatency {
+                    wait_ms: requested_at.elapsed().as_secs_f64() * 1000.0,
+                    cached,
+                    ..Default::default()
+                };
+                let texture_started = Instant::now();
                 let src_image = ColorImage::from_rgba_unmultiplied(
                     [decoded.width as usize, decoded.height as usize],
                     &decoded.rgba,
@@ -788,16 +837,22 @@ impl CutDubApp {
                     TextureOptions::LINEAR,
                 ));
 
+                sample.texture_ms += texture_started.elapsed().as_secs_f64() * 1000.0;
                 // Compute Output preview (applying active filters when in Full Processing mode or when filters are enabled)
                 if !self.filters.is_empty() {
+                    let filters_started = Instant::now();
                     let (out_w, out_h, out_rgba) = self.filters.apply_to_rgba(
                         decoded.width,
                         decoded.height,
                         (*decoded.rgba).clone(),
                     );
+                    sample.filters_ms = filters_started.elapsed().as_secs_f64() * 1000.0;
                     if self.show_histogram {
+                        let histogram_started = Instant::now();
                         self.current_histogram = Some(compute_rgba_histogram(&out_rgba));
+                        sample.histogram_ms = histogram_started.elapsed().as_secs_f64() * 1000.0;
                     }
+                    let texture_started = Instant::now();
                     let out_image = ColorImage::from_rgba_unmultiplied(
                         [out_w as usize, out_h as usize],
                         &out_rgba,
@@ -807,14 +862,29 @@ impl CutDubApp {
                         out_image,
                         TextureOptions::LINEAR,
                     ));
+                    sample.texture_ms += texture_started.elapsed().as_secs_f64() * 1000.0;
                 } else {
                     if self.show_histogram {
+                        let histogram_started = Instant::now();
                         self.current_histogram = Some(compute_rgba_histogram(&decoded.rgba));
+                        sample.histogram_ms = histogram_started.elapsed().as_secs_f64() * 1000.0;
                     }
                     self.output_texture = self.source_texture.clone();
                 }
 
                 self.displayed_frame_key = Some(target_key);
+                sample.total_ms = requested_at.elapsed().as_secs_f64() * 1000.0;
+                if !self.playback.is_playing {
+                    tracing::debug!(source_id = resolved.source_id, frame = resolved.source_frame,
+                        total_ms = sample.total_ms, wait_ms = sample.wait_ms,
+                        filters_ms = sample.filters_ms, histogram_ms = sample.histogram_ms,
+                        texture_queue_ms = sample.texture_ms, cached = sample.cached,
+                        "Navigation preview prepared (CPU timing; excludes GPU presentation)");
+                    engine.prefetch_navigation(clip, resolved.source_frame);
+                }
+                self.pending_preview = None;
+                self.pending_preview_cache_hit = None;
+                self.preview_latency = Some(sample);
             }
         } else {
             // Decode is in flight on worker thread; schedule repaint so we pick it up promptly
@@ -852,9 +922,15 @@ impl CutDubApp {
             return;
         }
 
+        let input_started = Instant::now();
+        let previous_frame = self.project.current_frame;
         let mut open_dialog = false;
         let mut trigger_export = false;
         let mut trigger_snapshot = false;
+        let preview_ready = self.project.resolve_frame(self.project.current_frame)
+            .is_some_and(|resolved| self.displayed_frame_key
+                .is_some_and(|(source_id, frame, _)|
+                    source_id == resolved.source_id && frame == resolved.source_frame));
         ctx.input_mut(|i| {
             // File / Project shortcuts
             if i.consume_key(Modifiers::COMMAND, Key::O) {
@@ -913,29 +989,62 @@ impl CutDubApp {
                 }
             }
 
+            // Only deliberate presses may supersede an image still decoding.
+            // Held-key repeats are discarded until the previous target is visible.
+            let repeat_ready = navigation_repeat_ready(&i.events, preview_ready);
             // Navigation: Left/Right (1 frame), Shift+Left/Right (Prev/Next Keyframe), Alt+Left/Right (10 frames)
             if i.consume_key(Modifiers::SHIFT, Key::ArrowLeft)
                 || i.key_pressed(Key::PageUp)
             {
                 self.playback.pause();
-                self.project.seek_prev_keyframe();
+                if repeat_ready {
+                    self.project.seek_prev_keyframe();
+                    if let Some(engine) = &mut self.preview_engine {
+                        engine.navigation_hint = Some(NavigationHint::Keyframes { backwards: true });
+                    }
+                }
             } else if i.consume_key(Modifiers::SHIFT, Key::ArrowRight)
                 || i.key_pressed(Key::PageDown)
             {
                 self.playback.pause();
-                self.project.seek_next_keyframe();
+                if repeat_ready {
+                    self.project.seek_next_keyframe();
+                    if let Some(engine) = &mut self.preview_engine {
+                        engine.navigation_hint = Some(NavigationHint::Keyframes { backwards: false });
+                    }
+                }
             } else if i.consume_key(Modifiers::ALT, Key::ArrowLeft) {
                 self.playback.pause();
-                self.project.step_backward(10);
+                if repeat_ready {
+                    self.project.step_backward(10);
+                    if let Some(engine) = &mut self.preview_engine {
+                        engine.navigation_hint = Some(NavigationHint::Frames(-10));
+                    }
+                }
             } else if i.consume_key(Modifiers::ALT, Key::ArrowRight) {
                 self.playback.pause();
-                self.project.step_forward(10);
+                if repeat_ready {
+                    self.project.step_forward(10);
+                    if let Some(engine) = &mut self.preview_engine {
+                        engine.navigation_hint = Some(NavigationHint::Frames(10));
+                    }
+                }
             } else if i.key_pressed(Key::ArrowLeft) {
                 self.playback.pause();
-                self.project.step_backward(1);
+                if repeat_ready {
+                    self.project.step_backward(1);
+                    if let Some(engine) = &mut self.preview_engine {
+                        engine.navigation_hint = Some(NavigationHint::Frames(-1));
+                    }
+                }
             } else if i.key_pressed(Key::ArrowRight) {
                 self.playback.pause();
-                self.project.step_forward(1);
+                if repeat_ready {
+                    self.project.step_forward(1);
+                    if let Some(engine) = &mut self.preview_engine {
+                        engine.navigation_hint = Some(NavigationHint::Frames(1));
+                    }
+                }
             }
 
             if i.key_pressed(Key::Home) {
@@ -981,6 +1090,12 @@ impl CutDubApp {
                 }
             }
         });
+        if self.project.current_frame != previous_frame {
+            if let Some(resolved) = self.project.resolve_frame(self.project.current_frame) {
+                self.pending_preview = Some(((resolved.source_id, resolved.source_frame), input_started));
+                self.pending_preview_cache_hit = None;
+            }
+        }
         if open_dialog {
             if let Some(path) = rfd::FileDialog::new()
                 .add_filter(
@@ -1604,6 +1719,22 @@ impl CutDubApp {
     }
 
     fn render_preview_area(&mut self, ui: &mut Ui) {
+        if self.binaries.is_none() {
+            ui.vertical_centered(|ui| {
+                ui.add_space(48.0);
+                ui.heading("FFmpeg is unavailable");
+                ui.add_space(8.0);
+                ui.label("CutDub needs FFmpeg and ffprobe to open, preview, and export videos.");
+                if let Some(error) = &self.toolchain_error {
+                    ui.colored_label(Color32::from_rgb(255, 110, 110), error);
+                }
+                ui.add_space(12.0);
+                if ui.button("Show setup instructions...").clicked() {
+                    self.show_ffmpeg_dialog = true;
+                }
+            });
+            return;
+        }
         let avail = ui.available_size();
         if !self.project.is_loaded() {
             ui.allocate_ui_with_layout(
@@ -2724,226 +2855,258 @@ impl CutDubApp {
             .unwrap_or((1920, 1080));
 
         ui.add_space(6.0);
-        ui.menu_button("➕ Add Video Filter...", |ui| {
-            if ui.button("Crop (Margins / Aspect Presets)").clicked() {
-                self.filters.add(FilterKind::Crop {
-                    left: 0,
-                    top: 0,
-                    right: 0,
-                    bottom: 0,
-                });
-                self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
-                ui.close_menu();
-            }
-            if ui.button("Resize / Scale (Dimensions / % / Aspect Lock)").clicked() {
-                self.filters.add(FilterKind::new_resize(
-                    src_w,
-                    src_h,
-                    ScalingAlgorithm::Lanczos,
-                ));
-                self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
-                ui.close_menu();
-            }
-            if ui.button("Rotate (90° / 180° / 270° / Fine Angle)").clicked() {
-                self.filters.add(FilterKind::Rotate {
-                    angle: RotationAngle::Rotate90Cw,
-                    custom_degrees: 0.0,
-                    bilinear: true,
-                });
-                self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
-                ui.close_menu();
-            }
-            if ui.button("Flip / Mirror").clicked() {
-                self.filters.add(FilterKind::Flip {
-                    horizontal: true,
-                    vertical: false,
-                });
-                self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
-                ui.close_menu();
-            }
-            if ui.button("Brightness, Contrast & Gamma").clicked() {
-                self.filters.add(FilterKind::BrightnessContrast {
-                    brightness: 0.0,
-                    contrast: 1.0,
-                    gamma: 1.0,
-                });
-                self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
-                ui.close_menu();
-            }
-            if ui.button("Colour & White Balance (Sat / Temp / RGB)").clicked() {
-                self.filters.add(FilterKind::ColorAdjust {
-                    saturation: 1.0,
-                    gamma: 1.0,
-                    hue_degrees: 0.0,
-                    temperature: 0.0,
-                    r_offset: 0.0,
-                    g_offset: 0.0,
-                    b_offset: 0.0,
-                });
-                self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
-                ui.close_menu();
-            }
-            if ui.button("Deinterlace (BWDIF / YADIF)").clicked() {
-                self.filters.add(FilterKind::Deinterlace {
-                    mode: DeinterlaceMode::SendFrame,
-                    engine: DeinterlaceEngine::Bwdif,
-                    parity: FieldParity::Auto,
-                });
-                self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
-                ui.close_menu();
-            }
-            if ui.button("Sharpen (Unsharp Mask / CAS)").clicked() {
-                self.filters.add(FilterKind::Sharpen {
-                    amount: 1.0,
-                    mode: SharpenMode::UnsharpMask,
-                    radius: 5,
-                    chroma_amount: 0.0,
-                });
-                self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
-                ui.close_menu();
-            }
-            if ui.button("Denoise (3D Spatial + Temporal)").clicked() {
-                self.filters.add(FilterKind::Denoise {
-                    luma_spatial: 4.0,
-                    chroma_spatial: 3.0,
-                    luma_temporal: 6.0,
-                    chroma_temporal: 4.5,
-                    mode: DenoiseMode::Hqdn3d,
-                });
-                self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
-                ui.close_menu();
-            }
-            if ui.button("Lens Vignette").clicked() {
-                self.filters.add(FilterKind::Vignette {
-                    angle_rad: 0.45,
-                    backward: false,
-                });
-                self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
-                ui.close_menu();
-            }
-            if ui
-                .button("Temporal Speed & Framerate (setpts / fps)")
-                .clicked()
-            {
-                self.filters.add(FilterKind::TemporalSpeed {
-                    speed_factor: 1.0,
-                    target_fps: None,
-                });
-                self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
-                ui.close_menu();
-            }
-            if ui.button("Grayscale (Monochrome)").clicked() {
-                self.filters.add(FilterKind::Grayscale);
-                self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
-                ui.close_menu();
-            }
-            ui.separator();
-            ui.label(RichText::new("Classic VirtualDub Filters").size(11.0).weak());
-            if ui.button("Levels (Input / Gamma / Output Range)").clicked() {
-                self.filters.add(FilterKind::Levels {
-                    input_black: 0,
-                    input_white: 255,
-                    gamma: 1.0,
-                    output_black: 0,
-                    output_white: 255,
-                    luma_only: false,
-                });
-                self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
-                ui.close_menu();
-            }
-            if ui.button("HSV Adjust (Hue / Saturation / Value)").clicked() {
-                self.filters.add(FilterKind::HsvAdjust {
-                    hue_degrees: 0.0,
-                    saturation: 1.0,
-                    value: 1.0,
-                });
-                self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
-                ui.close_menu();
-            }
-            if ui.button("Blur / Gaussian Blur").clicked() {
-                self.filters.add(FilterKind::Blur {
-                    sigma: 2.0,
-                    steps: 2,
-                });
-                self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
-                ui.close_menu();
-            }
-            if ui.button("Invert / Negate Channels").clicked() {
-                self.filters.add(FilterKind::Invert {
-                    invert_r: true,
-                    invert_g: true,
-                    invert_b: true,
-                });
-                self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
-                ui.close_menu();
-            }
-            if ui.button("Threshold (1-Bit Binary Luma)").clicked() {
-                self.filters.add(FilterKind::Threshold { level: 128 });
-                self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
-                ui.close_menu();
-            }
-            if ui
-                .button("Emboss & Edge Matrix (3×3 Convolution)")
-                .clicked()
-            {
-                self.filters.add(FilterKind::EmbossEdge {
-                    preset: ConvolutionPreset::Emboss,
-                    strength: 1.0,
-                });
-                self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
-                ui.close_menu();
-            }
-            if ui.button("2:1 Reduction (Half-Size Downsample)").clicked() {
-                self.filters.add(FilterKind::TwoToOneReduction {
-                    high_quality: true,
-                });
-                self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
-                ui.close_menu();
-            }
-            if ui.button("Border / Letterbox / Canvas Pad").clicked() {
-                self.filters.add(FilterKind::BorderFill {
-                    left: 0,
-                    top: 40,
-                    right: 0,
-                    bottom: 40,
-                    color_rgb: [0, 0, 0],
-                    expand_canvas: false,
-                });
-                self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
-                ui.close_menu();
-            }
-            if ui.button("Field Swap (Swap Even/Odd Scanlines)").clicked() {
-                self.filters.add(FilterKind::FieldSwap);
-                self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
-                ui.close_menu();
-            }
-            ui.separator();
-            ui.label(RichText::new("Overlays & Subtitles").size(11.0).weak());
-            if ui
-                .button("Text / Timecode / Frame Counter Overlay")
-                .clicked()
-            {
-                self.filters.add(FilterKind::TextOverlay {
-                    text: String::new(),
-                    show_timecode: true,
-                    show_frame_number: true,
-                    position: OverlayPosition::BottomLeft,
-                    font_size: 28,
-                    box_opacity: 0.55,
-                });
-                self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
-                ui.close_menu();
-            }
-            if ui
-                .button("Subtitle Burn-In (.srt / .ass / .vtt)")
-                .clicked()
-            {
-                self.filters.add(FilterKind::SubtitleBurnIn {
-                    subtitle_path: String::new(),
-                    font_size: 24,
-                });
-                self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
-                ui.close_menu();
+        ui.horizontal(|ui| {
+            ui.menu_button("➕ Add Video Filter...", |ui| {
+                if ui.button("Crop (Margins / Aspect Presets)").clicked() {
+                    self.filters.add(FilterKind::Crop {
+                        left: 0,
+                        top: 0,
+                        right: 0,
+                        bottom: 0,
+                    });
+                    self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
+                    ui.close_menu();
+                }
+                if ui
+                    .button("Resize / Scale (Dimensions / % / Aspect Lock)")
+                    .clicked()
+                {
+                    self.filters.add(FilterKind::new_resize(
+                        src_w,
+                        src_h,
+                        ScalingAlgorithm::Lanczos,
+                    ));
+                    self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
+                    ui.close_menu();
+                }
+                if ui
+                    .button("Rotate (90° / 180° / 270° / Fine Angle)")
+                    .clicked()
+                {
+                    self.filters.add(FilterKind::Rotate {
+                        angle: RotationAngle::Rotate90Cw,
+                        custom_degrees: 0.0,
+                        bilinear: true,
+                    });
+                    self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
+                    ui.close_menu();
+                }
+                if ui.button("Flip / Mirror").clicked() {
+                    self.filters.add(FilterKind::Flip {
+                        horizontal: true,
+                        vertical: false,
+                    });
+                    self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
+                    ui.close_menu();
+                }
+                if ui.button("Brightness, Contrast & Gamma").clicked() {
+                    self.filters.add(FilterKind::BrightnessContrast {
+                        brightness: 0.0,
+                        contrast: 1.0,
+                        gamma: 1.0,
+                    });
+                    self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
+                    ui.close_menu();
+                }
+                if ui
+                    .button("Colour & White Balance (Sat / Temp / RGB)")
+                    .clicked()
+                {
+                    self.filters.add(FilterKind::ColorAdjust {
+                        saturation: 1.0,
+                        gamma: 1.0,
+                        hue_degrees: 0.0,
+                        temperature: 0.0,
+                        r_offset: 0.0,
+                        g_offset: 0.0,
+                        b_offset: 0.0,
+                    });
+                    self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
+                    ui.close_menu();
+                }
+                if ui.button("Deinterlace (BWDIF / YADIF)").clicked() {
+                    self.filters.add(FilterKind::Deinterlace {
+                        mode: DeinterlaceMode::SendFrame,
+                        engine: DeinterlaceEngine::Bwdif,
+                        parity: FieldParity::Auto,
+                    });
+                    self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
+                    ui.close_menu();
+                }
+                if ui.button("Sharpen (Unsharp Mask / CAS)").clicked() {
+                    self.filters.add(FilterKind::Sharpen {
+                        amount: 1.0,
+                        mode: SharpenMode::UnsharpMask,
+                        radius: 5,
+                        chroma_amount: 0.0,
+                    });
+                    self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
+                    ui.close_menu();
+                }
+                if ui.button("Denoise (3D Spatial + Temporal)").clicked() {
+                    self.filters.add(FilterKind::Denoise {
+                        luma_spatial: 4.0,
+                        chroma_spatial: 3.0,
+                        luma_temporal: 6.0,
+                        chroma_temporal: 4.5,
+                        mode: DenoiseMode::Hqdn3d,
+                    });
+                    self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
+                    ui.close_menu();
+                }
+                if ui.button("Lens Vignette").clicked() {
+                    self.filters.add(FilterKind::Vignette {
+                        angle_rad: 0.45,
+                        backward: false,
+                    });
+                    self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
+                    ui.close_menu();
+                }
+                if ui
+                    .button("Temporal Speed & Framerate (setpts / fps)")
+                    .clicked()
+                {
+                    self.filters.add(FilterKind::TemporalSpeed {
+                        speed_factor: 1.0,
+                        target_fps: None,
+                    });
+                    self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
+                    ui.close_menu();
+                }
+                if ui.button("Grayscale (Monochrome)").clicked() {
+                    self.filters.add(FilterKind::Grayscale);
+                    self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
+                    ui.close_menu();
+                }
+                ui.separator();
+                ui.label(
+                    RichText::new("Classic VirtualDub Filters")
+                        .size(11.0)
+                        .weak(),
+                );
+                if ui.button("Levels (Input / Gamma / Output Range)").clicked() {
+                    self.filters.add(FilterKind::Levels {
+                        input_black: 0,
+                        input_white: 255,
+                        gamma: 1.0,
+                        output_black: 0,
+                        output_white: 255,
+                        luma_only: false,
+                    });
+                    self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
+                    ui.close_menu();
+                }
+                if ui.button("HSV Adjust (Hue / Saturation / Value)").clicked() {
+                    self.filters.add(FilterKind::HsvAdjust {
+                        hue_degrees: 0.0,
+                        saturation: 1.0,
+                        value: 1.0,
+                    });
+                    self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
+                    ui.close_menu();
+                }
+                if ui.button("Blur / Gaussian Blur").clicked() {
+                    self.filters.add(FilterKind::Blur {
+                        sigma: 2.0,
+                        steps: 2,
+                    });
+                    self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
+                    ui.close_menu();
+                }
+                if ui.button("Invert / Negate Channels").clicked() {
+                    self.filters.add(FilterKind::Invert {
+                        invert_r: true,
+                        invert_g: true,
+                        invert_b: true,
+                    });
+                    self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
+                    ui.close_menu();
+                }
+                if ui.button("Threshold (1-Bit Binary Luma)").clicked() {
+                    self.filters.add(FilterKind::Threshold { level: 128 });
+                    self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
+                    ui.close_menu();
+                }
+                if ui
+                    .button("Emboss & Edge Matrix (3×3 Convolution)")
+                    .clicked()
+                {
+                    self.filters.add(FilterKind::EmbossEdge {
+                        preset: ConvolutionPreset::Emboss,
+                        strength: 1.0,
+                    });
+                    self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
+                    ui.close_menu();
+                }
+                if ui.button("2:1 Reduction (Half-Size Downsample)").clicked() {
+                    self.filters
+                        .add(FilterKind::TwoToOneReduction { high_quality: true });
+                    self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
+                    ui.close_menu();
+                }
+                if ui.button("Border / Letterbox / Canvas Pad").clicked() {
+                    self.filters.add(FilterKind::BorderFill {
+                        left: 0,
+                        top: 40,
+                        right: 0,
+                        bottom: 40,
+                        color_rgb: [0, 0, 0],
+                        expand_canvas: false,
+                    });
+                    self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
+                    ui.close_menu();
+                }
+                if ui.button("Field Swap (Swap Even/Odd Scanlines)").clicked() {
+                    self.filters.add(FilterKind::FieldSwap);
+                    self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
+                    ui.close_menu();
+                }
+                ui.separator();
+                ui.label(RichText::new("Overlays & Subtitles").size(11.0).weak());
+                if ui
+                    .button("Text / Timecode / Frame Counter Overlay")
+                    .clicked()
+                {
+                    self.filters.add(FilterKind::TextOverlay {
+                        text: String::new(),
+                        show_timecode: true,
+                        show_frame_number: true,
+                        position: OverlayPosition::BottomLeft,
+                        font_size: 28,
+                        box_opacity: 0.55,
+                    });
+                    self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
+                    ui.close_menu();
+                }
+                if ui.button("Subtitle Burn-In (.srt / .ass / .vtt)").clicked() {
+                    self.filters.add(FilterKind::SubtitleBurnIn {
+                        subtitle_path: String::new(),
+                        font_size: 24,
+                    });
+                    self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
+                    ui.close_menu();
+                }
+            });
+
+            if !self.filters.filters.is_empty() {
+                if ui
+                    .small_button("Collapse All")
+                    .on_hover_text("Collapse all filters to compact headers")
+                    .clicked()
+                {
+                    for f in &mut self.filters.filters {
+                        f.is_open = false;
+                    }
+                }
+                if ui
+                    .small_button("Expand All")
+                    .on_hover_text("Expand all filter settings")
+                    .clicked()
+                {
+                    for f in &mut self.filters.filters {
+                        f.is_open = true;
+                    }
+                }
             }
         });
 
@@ -2963,19 +3126,66 @@ impl CutDubApp {
             ui.group(|ui| {
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut instance.enabled, "");
-                    ui.label(RichText::new(instance.kind.title()).strong());
+
+                    let arrow_text = if instance.is_open { "▼" } else { "▶" };
+                    let arrow_tooltip = if instance.is_open {
+                        "Collapse filter"
+                    } else {
+                        "Expand filter"
+                    };
+                    if ui.small_button(arrow_text).on_hover_text(arrow_tooltip).clicked() {
+                        instance.is_open = !instance.is_open;
+                    }
+
+                    let title_text = RichText::new(instance.kind.title())
+                        .strong()
+                        .color(if instance.enabled {
+                            ui.visuals().text_color()
+                        } else {
+                            ui.visuals().weak_text_color()
+                        });
+                    let title_resp = ui.add(egui::Label::new(title_text).sense(egui::Sense::click()));
+                    if title_resp
+                        .on_hover_text(if instance.is_open {
+                            "Click to collapse"
+                        } else {
+                            "Click to expand"
+                        })
+                        .clicked()
+                    {
+                        instance.is_open = !instance.is_open;
+                    }
+
+                    if !instance.is_open {
+                        let summary = instance.kind.summary();
+                        let summary_resp = ui.add(
+                            egui::Label::new(
+                                RichText::new(format!("— {summary}"))
+                                    .size(11.5)
+                                    .color(ui.visuals().weak_text_color()),
+                            )
+                            .sense(egui::Sense::click())
+                            .truncate(),
+                        );
+                        if summary_resp.on_hover_text("Click to expand").clicked() {
+                            instance.is_open = true;
+                        }
+                    }
+
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui.small_button("✖").on_hover_text("Remove filter").clicked() {
                             action_remove = Some(idx);
                         }
                         if ui
                             .add_enabled(idx + 1 < filter_len, egui::Button::new("⬇").small())
+                            .on_hover_text("Move filter down")
                             .clicked()
                         {
                             action_down = Some(idx);
                         }
                         if ui
                             .add_enabled(idx > 0, egui::Button::new("⬆").small())
+                            .on_hover_text("Move filter up")
                             .clicked()
                         {
                             action_up = Some(idx);
@@ -2983,7 +3193,9 @@ impl CutDubApp {
                     });
                 });
 
-                match &mut instance.kind {
+                if instance.is_open {
+                    ui.add_space(3.0);
+                    match &mut instance.kind {
                     FilterKind::Crop {
                         left,
                         top,
@@ -3674,7 +3886,8 @@ impl CutDubApp {
                         ui.add(egui::Slider::new(font_size, 12..=56).suffix(" pt").text("Font Size"));
                     }
                 }
-            });
+            }
+        });
         }
 
         if let Some(i) = action_up {
@@ -3797,11 +4010,17 @@ impl CutDubApp {
         ui.group(|ui| {
             ui.label(RichText::new("Encoding Presets").strong());
             egui::ComboBox::from_id_salt("preset_selector")
-                .selected_text("Load a preset...")
+                .selected_text(self.selected_preset.as_ref()
+                    .filter(|(_, settings)| settings == &self.export_settings)
+                    .map(|(name, _)| name.as_str()).unwrap_or("Custom"))
                 .show_ui(ui, |ui| {
                     for preset in &self.presets {
-                        if ui.button(&preset.name).clicked() {
-                            self.export_settings = preset.settings.clone();
+                        if let Some(available) = preset.available_with(&self.capabilities) {
+                            if ui.button(&available.name).clicked() {
+                                self.selected_preset = Some((available.name, available.settings.clone()));
+                                self.export_settings = available.settings;
+                                ui.close_menu();
+                            }
                         }
                     }
                 });
@@ -3812,8 +4031,16 @@ impl CutDubApp {
                         name: self.new_preset_name.trim().to_string(),
                         settings: self.export_settings.clone(),
                     });
-                    let _ = EncodingPreset::save_all(&self.paths.presets_file, &self.presets);
-                    self.new_preset_name.clear();
+                    match EncodingPreset::save_all(&self.paths.presets_file, &self.presets) {
+                        Ok(()) => {
+                            self.selected_preset = Some((self.new_preset_name.trim().to_string(), self.export_settings.clone()));
+                            self.new_preset_name.clear();
+                        }
+                        Err(error) => {
+                            self.presets.pop();
+                            self.set_status(format!("Could not save preset: {error}"), true);
+                        }
+                    }
                 }
             });
         });
@@ -3933,7 +4160,9 @@ impl CutDubApp {
                     let encoders = self.capabilities.preferred_video_encoders();
                     let mut picked_encoder: Option<String> = None;
                     egui::ComboBox::from_id_salt("video_encoder_combo")
-                        .selected_text(&self.export_settings.video_encoder)
+                        .selected_text(if self.capabilities.has_encoder(&self.export_settings.video_encoder) {
+                            self.export_settings.video_encoder.clone()
+                        } else { "Select an available encoder...".into() })
                         .show_ui(ui, |ui| {
                             for enc in &encoders {
                                 let badge = if enc.is_hardware { " [HW]" } else { " [SW]" };
@@ -4130,7 +4359,7 @@ impl CutDubApp {
             });
         } else if ui
             .add_enabled(
-                self.project.is_loaded(),
+                self.project.is_loaded() && self.export_settings.encoders_available(&self.capabilities),
                 egui::Button::new(
                     RichText::new("💾 Export Video Now... (Cmd/Ctrl+E)")
                         .size(14.5)
@@ -4162,6 +4391,19 @@ impl CutDubApp {
             "No Audio (Mute / Strip All Audio Tracks)",
         );
 
+        let primary_audio = self
+            .project
+            .audio_configs
+            .first()
+            .map(|c| (c.info.channels, c.info.sample_rate));
+        let (source_channels, source_sr) = match primary_audio {
+            Some((ch, sr)) => (Some(ch), Some(sr)),
+            None => (None, None),
+        };
+        let global_profile = self
+            .export_settings
+            .audio_bitrate_profile(source_channels, source_sr);
+
         if self.export_settings.audio_processing_mode != prev_mode {
             match self.export_settings.audio_processing_mode {
                 AudioProcessingMode::DirectStreamCopy => {
@@ -4170,6 +4412,8 @@ impl CutDubApp {
                     }
                 }
                 AudioProcessingMode::FullProcessing => {
+                    self.export_settings
+                        .clamp_audio_bitrate(source_channels, source_sr);
                     let enc = self.export_settings.audio_encoder.clone();
                     let br = self.export_settings.audio_bitrate_kbps;
                     for cfg in &mut self.project.audio_configs {
@@ -4193,7 +4437,9 @@ impl CutDubApp {
 
                 let mut picked_audio_enc: Option<String> = None;
                 egui::ComboBox::from_id_salt(format!("{id_prefix}_global_aud_enc"))
-                    .selected_text(&self.export_settings.audio_encoder)
+                    .selected_text(if self.capabilities.has_encoder(&self.export_settings.audio_encoder) {
+                        self.export_settings.audio_encoder.clone()
+                    } else { "Select an available audio encoder...".into() })
                     .show_ui(ui, |ui| {
                         for enc in &audio_encoders {
                             let badge = if enc.is_hardware { " [HW]" } else { " [SW]" };
@@ -4211,7 +4457,11 @@ impl CutDubApp {
                     });
                 if let Some(new_aud) = picked_audio_enc {
                     self.export_settings
-                        .apply_recommended_defaults_for_audio_encoder(&new_aud);
+                        .apply_recommended_defaults_for_audio_encoder_with_format(
+                            &new_aud,
+                            source_channels,
+                            source_sr,
+                        );
                     let br = self.export_settings.audio_bitrate_kbps;
                     for cfg in &mut self.project.audio_configs {
                         if matches!(cfg.mode, AudioExportMode::ReEncode { .. }) {
@@ -4223,7 +4473,7 @@ impl CutDubApp {
                     }
                 }
 
-                if is_lossless_or_pcm_audio_encoder(&self.export_settings.audio_encoder) {
+                if global_profile.is_lossless {
                     ui.label(
                         RichText::new("✔ Lossless / Uncompressed PCM (Bitrate not applicable)")
                             .size(11.0)
@@ -4234,7 +4484,7 @@ impl CutDubApp {
                         .add(
                             egui::Slider::new(
                                 &mut self.export_settings.audio_bitrate_kbps,
-                                32..=640,
+                                global_profile.min_kbps..=global_profile.max_kbps,
                             )
                             .suffix(" kbps")
                             .text("Bitrate"),
@@ -4253,8 +4503,8 @@ impl CutDubApp {
                         }
                     }
                     ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new("Bitrate:").size(11.0).weak());
-                        for preset_br in [96u32, 128, 160, 192, 256, 320, 512] {
+                        ui.label(RichText::new("Presets:").size(11.0).weak());
+                        for &preset_br in &global_profile.presets {
                             let active = self.export_settings.audio_bitrate_kbps == preset_br;
                             if ui.selectable_label(active, format!("{preset_br}k")).clicked() {
                                 self.export_settings.audio_bitrate_kbps = preset_br;
@@ -4270,8 +4520,17 @@ impl CutDubApp {
                             }
                         }
                     });
+
+                    if let Some(notice) = global_profile.notice {
+                        ui.label(
+                            RichText::new(format!("ℹ {notice}"))
+                                .size(11.0)
+                                .color(Color32::from_rgb(235, 185, 95)),
+                        );
+                    }
                 }
 
+                let prev_sr = self.export_settings.audio_sample_rate;
                 ui.horizontal(|ui| {
                     ui.label("Sample Rate:");
                     let sr_label = match self.export_settings.audio_sample_rate {
@@ -4301,7 +4560,18 @@ impl CutDubApp {
                             }
                         });
                 });
+                if self.export_settings.audio_sample_rate != prev_sr {
+                    self.export_settings
+                        .clamp_audio_bitrate(source_channels, source_sr);
+                    let br = self.export_settings.audio_bitrate_kbps;
+                    for cfg in &mut self.project.audio_configs {
+                        if let AudioExportMode::ReEncode { bitrate_kbps, .. } = &mut cfg.mode {
+                            *bitrate_kbps = br;
+                        }
+                    }
+                }
 
+                let prev_ch = self.export_settings.audio_channels;
                 ui.horizontal(|ui| {
                     ui.label("Channels:");
                     egui::ComboBox::from_id_salt(format!("{id_prefix}_aud_ch"))
@@ -4316,6 +4586,16 @@ impl CutDubApp {
                             }
                         });
                 });
+                if self.export_settings.audio_channels != prev_ch {
+                    self.export_settings
+                        .clamp_audio_bitrate(source_channels, source_sr);
+                    let br = self.export_settings.audio_bitrate_kbps;
+                    for cfg in &mut self.project.audio_configs {
+                        if let AudioExportMode::ReEncode { bitrate_kbps, .. } = &mut cfg.mode {
+                            *bitrate_kbps = br;
+                        }
+                    }
+                }
 
                 ui.horizontal(|ui| {
                     ui.add(
@@ -4381,27 +4661,83 @@ impl CutDubApp {
                             bitrate_kbps,
                         } = &mut cfg.mode
                         {
+                            let track_ch = self
+                                .export_settings
+                                .audio_channels
+                                .channel_count()
+                                .unwrap_or(cfg.info.channels);
+                            let track_sr = self
+                                .export_settings
+                                .audio_sample_rate
+                                .unwrap_or(cfg.info.sample_rate);
+                            let mut track_profile = redub_export::audio_bitrate_profile(
+                                codec,
+                                Some(track_sr),
+                                track_ch,
+                            );
+
                             ui.horizontal(|ui| {
                                 ui.label("Codec:");
+                                let mut track_enc_changed = false;
                                 egui::ComboBox::from_id_salt(format!("{id_prefix}_aud_enc_{idx}"))
                                     .selected_text(codec.clone())
                                     .show_ui(ui, |ui| {
                                         for enc in &audio_encoders {
-                                            ui.selectable_value(
-                                                codec,
-                                                enc.name.clone(),
-                                                &enc.name,
-                                            );
+                                            if ui
+                                                .selectable_value(
+                                                    codec,
+                                                    enc.name.clone(),
+                                                    &enc.name,
+                                                )
+                                                .clicked()
+                                            {
+                                                track_enc_changed = true;
+                                            }
                                         }
                                     });
-                                if !is_lossless_or_pcm_audio_encoder(codec) {
+                                if track_enc_changed {
+                                    track_profile = redub_export::audio_bitrate_profile(
+                                        codec,
+                                        Some(track_sr),
+                                        track_ch,
+                                    );
+                                    if !track_profile.is_lossless {
+                                        *bitrate_kbps = track_profile.default_kbps;
+                                    }
+                                }
+
+                                if is_lossless_or_pcm_audio_encoder(codec) {
+                                    ui.label(RichText::new("Lossless / PCM").size(11.0).weak());
+                                } else {
+                                    *bitrate_kbps = (*bitrate_kbps)
+                                        .clamp(track_profile.min_kbps, track_profile.max_kbps);
                                     ui.add(
                                         egui::DragValue::new(bitrate_kbps)
-                                            .range(32..=640)
+                                            .range(track_profile.min_kbps..=track_profile.max_kbps)
+                                            .speed(8)
                                             .suffix(" kbps"),
                                     );
+                                    for &p_br in &track_profile.presets {
+                                        if ui
+                                            .selectable_label(
+                                                *bitrate_kbps == p_br,
+                                                format!("{p_br}k"),
+                                            )
+                                            .clicked()
+                                        {
+                                            *bitrate_kbps = p_br;
+                                        }
+                                    }
                                 }
                             });
+
+                            if let Some(notice) = track_profile.notice {
+                                ui.label(
+                                    RichText::new(format!("ℹ {notice}"))
+                                        .size(10.5)
+                                        .color(Color32::from_rgb(235, 185, 95)),
+                                );
+                            }
                         }
 
                         ui.horizontal(|ui| {
@@ -5125,6 +5461,12 @@ impl CutDubApp {
                         ));
                         ui.separator();
                         ui.label(RichText::new("Preview Frame Cache & Decoding Telemetry:").strong());
+                        if let Some(sample) = &self.preview_latency {
+                            ui.monospace(format!("Preview ready: {:.1} ms | wait {:.1} | filters {:.1} | scope {:.1} | texture prep {:.1}",
+                                sample.total_ms, sample.wait_ms, sample.filters_ms,
+                                sample.histogram_ms, sample.texture_ms));
+                            ui.label("CPU timings include polling and preparation; GPU upload/presentation is not measured.");
+                        }
                         if let Some(engine) = &self.preview_engine {
                             let c = &engine.cache;
                             ui.monospace(format!(
@@ -5151,9 +5493,25 @@ impl CutDubApp {
                         }
                     } else {
                         ui.label(
-                            RichText::new("FFmpeg / ffprobe not found in PATH!")
+                            RichText::new("FFmpeg setup required")
                                 .color(Color32::from_rgb(255, 110, 110)),
                         );
+                        if let Some(error) = &self.toolchain_error {
+                            ui.label(error);
+                        }
+                        ui.add_space(8.0);
+                        ui.label("Install FFmpeg, including ffprobe, and restart CutDub.");
+                        #[cfg(target_os = "macos")]
+                        ui.monospace("brew install ffmpeg");
+                        #[cfg(target_os = "linux")]
+                        ui.label("On Debian / Ubuntu: sudo apt install ffmpeg");
+                        #[cfg(target_os = "windows")]
+                        ui.monospace("winget install Gyan.FFmpeg");
+                        ui.add_space(8.0);
+                        ui.label("Already installed? Make sure both executables are on PATH, or set their full paths before launching CutDub:");
+                        ui.monospace("CUTDUB_FFMPEG=/path/to/ffmpeg");
+                        ui.monospace("CUTDUB_FFPROBE=/path/to/ffprobe");
+                        ui.label("If an executable was found but could not run, check its permissions and required libraries.");
                     }
                 });
             self.show_ffmpeg_dialog = open;
@@ -5233,4 +5591,38 @@ fn configure_dark_theme(ctx: &Context) {
     visuals.selection.bg_fill = Color32::from_rgb(55, 125, 210);
     visuals.window_corner_radius = CornerRadius::same(6);
     ctx.set_visuals(visuals);
+}
+
+// OS key repeat can outrun decoding by hundreds of frames per second when each
+// event jumps ten frames or a GOP. Never queue repeats behind an unseen image.
+fn navigation_repeat_ready(events: &[egui::Event], preview_ready: bool) -> bool {
+    preview_ready || !events.iter().any(|event| matches!(event,
+        egui::Event::Key {
+            key: Key::ArrowLeft | Key::ArrowRight | Key::PageUp | Key::PageDown,
+            pressed: true, repeat: true, ..
+        }
+    ))
+}
+
+#[cfg(test)]
+mod navigation_tests {
+    use super::*;
+
+    fn arrow_event(repeat: bool, modifiers: Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key: Key::ArrowRight, physical_key: None,
+            pressed: true, repeat, modifiers,
+        }
+    }
+
+    #[test]
+    fn held_navigation_waits_for_visible_target_without_blocking_fresh_presses() {
+        for modifiers in [Modifiers::NONE, Modifiers::ALT, Modifiers::SHIFT] {
+            let repeat = [arrow_event(true, modifiers)];
+            assert!(!navigation_repeat_ready(&repeat, false));
+            assert!(navigation_repeat_ready(&repeat, true));
+            let press = [arrow_event(false, modifiers)];
+            assert!(navigation_repeat_ready(&press, false));
+        }
+    }
 }

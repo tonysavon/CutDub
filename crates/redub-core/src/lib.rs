@@ -5,6 +5,7 @@
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -182,7 +183,7 @@ pub struct FrameEntry {
 /// Supports both variable frame rate (VFR) and constant frame rate (CFR) streams.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FrameTimingMap {
-    pub entries: Vec<FrameEntry>,
+    pub entries: Arc<Vec<FrameEntry>>,
     pub nominal_fps: Rational,
     pub time_base: Rational,
     pub is_vfr: bool,
@@ -228,7 +229,7 @@ impl FrameTimingMap {
         };
 
         Self {
-            entries,
+            entries: Arc::new(entries),
             nominal_fps,
             time_base,
             is_vfr,
@@ -262,7 +263,7 @@ impl FrameTimingMap {
             });
         }
         Self {
-            entries,
+            entries: Arc::new(entries),
             nominal_fps,
             time_base,
             is_vfr: false,
@@ -394,18 +395,19 @@ impl FrameTimingMap {
         if !has_in_window {
             return;
         }
-        for entry in &mut self.entries {
-            if entry.pts_us >= window_start && entry.pts_us <= window_end && entry.frame_number > 0 {
+        for entry in Arc::make_mut(&mut self.entries) {
+            if entry.pts_us >= window_start && entry.pts_us <= window_end && entry.frame_number > 0
+            {
                 entry.is_keyframe = false;
             }
         }
         for &kf_ts in keyframe_pts {
             let idx = self.timestamp_to_frame(kf_ts) as usize;
-            if let Some(entry) = self.entries.get_mut(idx) {
+            if let Some(entry) = Arc::make_mut(&mut self.entries).get_mut(idx) {
                 entry.is_keyframe = true;
             }
         }
-        if let Some(first) = self.entries.first_mut() {
+        if let Some(first) = Arc::make_mut(&mut self.entries).first_mut() {
             first.is_keyframe = true;
         }
     }
@@ -1467,6 +1469,26 @@ mod tests {
             subtitle_streams: vec![],
             waveform: None,
         }
+    }
+
+    #[test]
+    fn timing_clones_share_storage_and_local_updates_are_isolated() {
+        let original = sample_source(120, 30).timing;
+        let mut updated = original.clone();
+        assert!(Arc::ptr_eq(&original.entries, &updated.entries));
+        updated.apply_local_keyframes(
+            TimestampUs::ZERO,
+            updated.frame_to_timestamp(60),
+            &[updated.frame_to_timestamp(15)],
+        );
+        assert!(!Arc::ptr_eq(&original.entries, &updated.entries));
+        assert!(!original.entries[15].is_keyframe);
+        assert!(updated.entries[15].is_keyframe);
+        assert!(original.entries[30].is_keyframe);
+        assert!(!updated.entries[30].is_keyframe);
+        let json = serde_json::to_string(&updated).unwrap();
+        let restored: FrameTimingMap = serde_json::from_str(&json).unwrap();
+        assert_eq!(updated.entries, restored.entries);
     }
 
     #[test]

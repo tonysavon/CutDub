@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "0.1.0"
+    [string]$Version = "0.1.1"
 )
 
 $ErrorActionPreference = "Stop"
@@ -7,7 +7,7 @@ $AppName = "CutDub"
 $BinName = "cutdub.exe"
 
 Write-Host "==> Building $AppName v$Version (Windows x86_64) in release mode..."
-cargo build --release --bin cutdub --target x86_64-pc-windows-msvc
+cargo build --locked --release --bin cutdub --target x86_64-pc-windows-msvc
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 $DistDir = "releases\$Version"

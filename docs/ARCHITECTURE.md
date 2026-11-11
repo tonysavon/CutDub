@@ -70,4 +70,4 @@ CutDub is architected as a modular 7-crate Rust workspace separating platform in
 - **Decision:**
   - `redub-filters::FilterPipeline` compiles any sequence of enabled `FilterInstance`s into both:
     1. An exact FFmpeg `-vf` filtergraph string (`to_ffmpeg_filtergraph`) used by `redub-export`, and
-    2. An in-memory RGBA buffer processor (`apply_to_rgba`) used by `redub-app` to update the Output preview panel at 60 fps as filter sliders are adjusted.
+    2. An in-memory RGBA buffer processor (`apply_to_rgba`) used by `redub-app` to update the Output preview panel as frames or filter settings change; processing cost depends on the active filters.

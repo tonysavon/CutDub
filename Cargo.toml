@@ -12,7 +12,7 @@ members = [
 default-members = ["crates/redub-app"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "GPL-3.0-or-later"
 authors = ["CutDub Contributors"]
@@ -21,7 +21,7 @@ repository = "https://github.com/tonysavon/CutDub"
 [workspace.dependencies]
 anyhow = "1.0"
 thiserror = "2.0"
-serde = { version = "1.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -30,6 +30,8 @@ eframe = { version = "0.31", default-features = false, features = [
     "default_fonts",
     "wgpu",
     "persistence",
+    "x11",
+    "wayland",
 ] }
 rfd = "0.15"
 directories = "6.0"
