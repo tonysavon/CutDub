@@ -13,6 +13,7 @@
 - Added the CutDub Split Play icon to app windows, macOS bundles, Windows executables, and Linux launchers.
 - Added collapsible filters and improved audio encoding controls and bitrate defaults.
 - The preset selector shows the selected preset, switches to Custom after changes, and reports save failures.
+- Fixed low-contrast controls when the operating system uses a light appearance.
 - Added Linux release packaging, automatic checksums, and ad-hoc macOS bundle signing.
 
 FFmpeg and ffprobe are required separately. Optional VVC encoding requires native

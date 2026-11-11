@@ -5580,6 +5580,8 @@ impl eframe::App for CutDubApp {
 }
 
 fn configure_dark_theme(ctx: &Context) {
+    // The custom preview and status colors are designed for a dark surface.
+    ctx.set_theme(egui::Theme::Dark);
     let mut visuals = egui::Visuals::dark();
     visuals.window_fill = Color32::from_rgb(24, 27, 34);
     visuals.panel_fill = Color32::from_rgb(24, 27, 34);
