@@ -256,6 +256,8 @@ pub struct AppSettings {
     pub custom_ffprobe_path: Option<PathBuf>,
     pub frame_cache_capacity: usize,
     pub prefer_hardware_decode: bool,
+    #[serde(default)]
+    pub last_video_encoder: Option<String>,
     pub recent_files: Vec<PathBuf>,
     pub max_recent_files: usize,
 }
@@ -267,6 +269,7 @@ impl Default for AppSettings {
             custom_ffprobe_path: None,
             frame_cache_capacity: 48,
             prefer_hardware_decode: true,
+            last_video_encoder: None,
             recent_files: Vec::new(),
             max_recent_files: 10,
         }

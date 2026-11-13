@@ -758,8 +758,15 @@ impl ExportSettings {
             || new_encoder.contains("nvenc")
             || new_encoder.contains("qsv")
             || new_encoder.contains("amf")
+            || new_encoder.contains("vaapi")
         {
-            self.crf = 20;
+            self.crf = if new_encoder.starts_with("av1_") {
+                26
+            } else if new_encoder.starts_with("hevc_") {
+                22
+            } else {
+                20
+            };
         }
     }
 }
@@ -908,14 +915,74 @@ impl EncodingPreset {
                     ..ExportSettings::default()
                 },
             },
+            Self {
+                name: "Hardware H.264 (Fast GPU, MP4)".into(),
+                settings: ExportSettings {
+                    processing_mode: VideoProcessingMode::FullProcessing,
+                    container: ContainerFormat::Mp4,
+                    video_encoder: "h264_hw".into(),
+                    crf: 20,
+                    encoder_preset: "fast".into(),
+                    audio_processing_mode: AudioProcessingMode::FullProcessing,
+                    ..ExportSettings::default()
+                },
+            },
+            Self {
+                name: "Hardware HEVC / H.265 (GPU, MKV)".into(),
+                settings: ExportSettings {
+                    processing_mode: VideoProcessingMode::FullProcessing,
+                    container: ContainerFormat::Mkv,
+                    video_encoder: "hevc_hw".into(),
+                    crf: 22,
+                    encoder_preset: "fast".into(),
+                    audio_processing_mode: AudioProcessingMode::FullProcessing,
+                    ..ExportSettings::default()
+                },
+            },
+            Self {
+                name: "Hardware AV1 (GPU, MKV)".into(),
+                settings: ExportSettings {
+                    processing_mode: VideoProcessingMode::FullProcessing,
+                    container: ContainerFormat::Mkv,
+                    video_encoder: "av1_hw".into(),
+                    crf: 26,
+                    encoder_preset: "fast".into(),
+                    audio_processing_mode: AudioProcessingMode::FullProcessing,
+                    ..ExportSettings::default()
+                },
+            },
         ]
     }
 
-    /// Resolve built-in AV1 templates to an installed implementation, and hide
-    /// presets whose required video/audio encoder is unavailable.
+    /// Resolve built-in AV1 and hardware GPU templates to an installed/verified implementation,
+    /// and hide presets whose required video/audio encoder is unavailable.
     pub fn available_with(&self, caps: &MediaCapabilities) -> Option<Self> {
         let mut preset = self.clone();
-        if matches!(preset.name.as_str(), "WebM AV1 (CRF 28 + Opus)"
+        if preset.settings.video_encoder == "h264_hw" {
+            if let Some(hw) = caps
+                .preferred_video_encoders()
+                .into_iter()
+                .find(|e| e.is_hardware && e.name.starts_with("h264_"))
+            {
+                preset.settings.video_encoder = hw.name;
+            }
+        } else if preset.settings.video_encoder == "hevc_hw" {
+            if let Some(hw) = caps
+                .preferred_video_encoders()
+                .into_iter()
+                .find(|e| e.is_hardware && e.name.starts_with("hevc_"))
+            {
+                preset.settings.video_encoder = hw.name;
+            }
+        } else if preset.settings.video_encoder == "av1_hw" {
+            if let Some(hw) = caps
+                .preferred_video_encoders()
+                .into_iter()
+                .find(|e| e.is_hardware && e.name.starts_with("av1_"))
+            {
+                preset.settings.video_encoder = hw.name;
+            }
+        } else if matches!(preset.name.as_str(), "WebM AV1 (CRF 28 + Opus)"
             | "High Quality AV1 (CRF 24, MKV)" | "Compact AV1 (CRF 32, MKV)")
             && preset.settings.video_encoder == "libsvtav1"
             && !caps.has_encoder("libsvtav1") && caps.has_encoder("libaom-av1") {
@@ -1713,10 +1780,108 @@ fn build_single_segment_command(
                 cmd.args(["-preset", vvenc_preset, "-pix_fmt", "yuv420p10le"]);
             } else if enc.contains("videotoolbox") {
                 if let Some(kbps) = target_v_kbps {
-                    cmd.args(["-b:v", &format!("{kbps}k"), "-pix_fmt", "yuv420p"]);
+                    cmd.args(["-b:v", &format!("{kbps}k")]);
                 } else {
                     let q = (100u32.saturating_sub(settings.crf as u32 * 2)).clamp(20, 95);
-                    cmd.args(["-q:v", &q.to_string(), "-pix_fmt", "yuv420p"]);
+                    cmd.args(["-q:v", &q.to_string()]);
+                }
+                if !enc.starts_with("prores_") {
+                    cmd.args(["-pix_fmt", "yuv420p"]);
+                }
+                if enc.contains("hevc")
+                    && (settings.container == ContainerFormat::Mp4
+                        || settings.container == ContainerFormat::Mov)
+                {
+                    cmd.args(["-tag:v", "hvc1"]);
+                }
+            } else if enc.ends_with("_amf") {
+                let amf_quality = match settings.encoder_preset.as_str() {
+                    "ultrafast" | "superfast" | "veryfast" | "faster" | "fast" => "speed",
+                    "medium" => "balanced",
+                    _ => "quality",
+                };
+                if let Some(kbps) = target_v_kbps {
+                    cmd.args([
+                        "-b:v",
+                        &format!("{kbps}k"),
+                        "-maxrate",
+                        &format!("{}k", (kbps * 3) / 2),
+                        "-bufsize",
+                        &format!("{}k", kbps * 2),
+                    ]);
+                } else {
+                    let qp = settings.crf.clamp(0, 51).to_string();
+                    cmd.args(["-rc", "cqp", "-qp_i", &qp, "-qp_p", &qp]);
+                }
+                cmd.args(["-quality", amf_quality, "-pix_fmt", "yuv420p"]);
+                if enc.contains("hevc")
+                    && (settings.container == ContainerFormat::Mp4
+                        || settings.container == ContainerFormat::Mov)
+                {
+                    cmd.args(["-tag:v", "hvc1"]);
+                }
+            } else if enc.ends_with("_nvenc") {
+                let nvenc_preset = match settings.encoder_preset.as_str() {
+                    "ultrafast" | "superfast" | "veryfast" | "faster" | "fast" => "fast",
+                    "medium" => "medium",
+                    _ => "slow",
+                };
+                if let Some(kbps) = target_v_kbps {
+                    cmd.args([
+                        "-b:v",
+                        &format!("{kbps}k"),
+                        "-maxrate",
+                        &format!("{}k", (kbps * 3) / 2),
+                        "-bufsize",
+                        &format!("{}k", kbps * 2),
+                    ]);
+                } else {
+                    let cq = settings.crf.clamp(0, 51).to_string();
+                    cmd.args(["-rc", "vbr", "-cq", &cq, "-b:v", "0"]);
+                }
+                cmd.args(["-preset", nvenc_preset, "-pix_fmt", "yuv420p"]);
+                if enc.contains("hevc")
+                    && (settings.container == ContainerFormat::Mp4
+                        || settings.container == ContainerFormat::Mov)
+                {
+                    cmd.args(["-tag:v", "hvc1"]);
+                }
+            } else if enc.ends_with("_qsv") {
+                let qsv_preset = match settings.encoder_preset.as_str() {
+                    "ultrafast" | "superfast" | "veryfast" => "veryfast",
+                    "faster" => "faster",
+                    "fast" => "fast",
+                    "medium" => "medium",
+                    "slow" => "slow",
+                    "slower" => "slower",
+                    _ => "veryslow",
+                };
+                if let Some(kbps) = target_v_kbps {
+                    cmd.args([
+                        "-b:v",
+                        &format!("{kbps}k"),
+                        "-maxrate",
+                        &format!("{}k", (kbps * 3) / 2),
+                        "-bufsize",
+                        &format!("{}k", kbps * 2),
+                    ]);
+                } else {
+                    let gq = settings.crf.clamp(1, 51).to_string();
+                    cmd.args(["-global_quality", &gq]);
+                }
+                cmd.args(["-preset", qsv_preset, "-pix_fmt", "nv12"]);
+                if enc.contains("hevc")
+                    && (settings.container == ContainerFormat::Mp4
+                        || settings.container == ContainerFormat::Mov)
+                {
+                    cmd.args(["-tag:v", "hvc1"]);
+                }
+            } else if enc.ends_with("_vaapi") {
+                if let Some(kbps) = target_v_kbps {
+                    cmd.args(["-b:v", &format!("{kbps}k")]);
+                } else {
+                    let qp = settings.crf.clamp(1, 51).to_string();
+                    cmd.args(["-qp", &qp]);
                 }
                 if enc.contains("hevc")
                     && (settings.container == ContainerFormat::Mp4
@@ -1950,12 +2115,38 @@ fn map_vvenc_preset(preset: &str) -> &'static str {
 }
 
 fn matching_smart_encoder(source_codec: &str, fallback_encoder: &str) -> String {
-    match source_codec.to_lowercase().as_str() {
-        "h264" | "avc" => "libx264".to_string(),
-        "hevc" | "h265" => "libx265".to_string(),
+    let codec = source_codec.to_lowercase();
+    let fb = fallback_encoder.to_lowercase();
+    match codec.as_str() {
+        "h264" | "avc" => {
+            if fb.starts_with("h264_") {
+                fallback_encoder.to_string()
+            } else {
+                "libx264".to_string()
+            }
+        }
+        "hevc" | "h265" => {
+            if fb.starts_with("hevc_") {
+                fallback_encoder.to_string()
+            } else {
+                "libx265".to_string()
+            }
+        }
         "vvc" | "h266" => "libvvenc".to_string(),
-        "vp9" => "libvpx-vp9".to_string(),
-        "av1" => "libsvtav1".to_string(),
+        "vp9" => {
+            if fb.starts_with("vp9_") {
+                fallback_encoder.to_string()
+            } else {
+                "libvpx-vp9".to_string()
+            }
+        }
+        "av1" => {
+            if fb.starts_with("av1_") {
+                fallback_encoder.to_string()
+            } else {
+                "libsvtav1".to_string()
+            }
+        }
         "mpeg4" => "mpeg4".to_string(),
         _ => fallback_encoder.to_string(),
     }

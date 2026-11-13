@@ -52,8 +52,110 @@ pub struct MediaCapabilities {
     pub encoder_names: HashSet<String>,
 }
 
+/// Curated priority order of video encoders (software and hardware across Apple VideoToolbox,
+/// NVIDIA NVENC, AMD AMF, Intel QuickSync QSV, and Linux VA-API).
+pub const PREFERRED_VIDEO_ENCODERS: &[&str] = &[
+    // H.264 / AVC
+    "libx264",
+    "h264_videotoolbox",
+    "h264_nvenc",
+    "h264_amf",
+    "h264_qsv",
+    "h264_vaapi",
+    // H.265 / HEVC
+    "libx265",
+    "hevc_videotoolbox",
+    "hevc_nvenc",
+    "hevc_amf",
+    "hevc_qsv",
+    "hevc_vaapi",
+    // H.266 / VVC
+    "libvvenc",
+    // AV1
+    "libsvtav1",
+    "libaom-av1",
+    "av1_nvenc",
+    "av1_amf",
+    "av1_qsv",
+    "av1_vaapi",
+    "av1_videotoolbox",
+    // VP9
+    "libvpx-vp9",
+    "vp9_qsv",
+    "vp9_vaapi",
+    // ProRes / Archival / Legacy
+    "prores_ks",
+    "prores_videotoolbox",
+    "ffv1",
+    "mpeg4",
+];
+
+pub fn is_hardware_encoder_name(name: &str) -> bool {
+    name.ends_with("_videotoolbox")
+        || name.ends_with("_nvenc")
+        || name.ends_with("_amf")
+        || name.ends_with("_qsv")
+        || name.ends_with("_vaapi")
+        || name.ends_with("_mf")
+        || name.ends_with("_d3d12va")
+        || name.ends_with("_v4l2m2m")
+        || name.ends_with("_omx")
+        || name.ends_with("_rkmpp")
+        || name.ends_with("_vulkan")
+        || name.ends_with("_at")
+}
+
+/// Probes whether a hardware video encoder compiled into `ffmpeg` can actually initialize
+/// and encode a 1-frame test surface on the current machine's GPU/APU.
+///
+/// Desktop FFmpeg builds (especially on Windows and Linux) compile in stubs for NVIDIA NVENC,
+/// Intel QuickSync (QSV), AMD AMF, and VA-API simultaneously. Running a 1-frame null encode
+/// filters out encoders whose vendor driver or hardware is absent on the current system.
+pub fn probe_hardware_video_encoder(ffmpeg_path: &Path, encoder_name: &str) -> bool {
+    let mut cmd = Command::new(ffmpeg_path);
+    cmd.args(["-hide_banner", "-loglevel", "error"]);
+    if encoder_name.ends_with("_vaapi") {
+        cmd.args([
+            "-vaapi_device",
+            "/dev/dri/renderD128",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=256x256:r=30",
+            "-vf",
+            "format=nv12,hwupload",
+            "-frames:v",
+            "1",
+            "-c:v",
+            encoder_name,
+            "-f",
+            "null",
+            "-",
+        ]);
+    } else {
+        cmd.args([
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=256x256:r=30",
+            "-frames:v",
+            "1",
+            "-c:v",
+            encoder_name,
+            "-f",
+            "null",
+            "-",
+        ]);
+    }
+    configure_background_command(&mut cmd);
+    cmd.output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
 impl MediaCapabilities {
-    /// Queries `ffmpeg -encoders` and `ffmpeg -hwaccels` to discover available codecs and hardware acceleration.
+    /// Queries `ffmpeg -encoders` and `ffmpeg -hwaccels` to discover available codecs and
+    /// verifies hardware video encoders against the actual host GPU/CPU hardware.
     pub fn detect(binaries: &FfmpegBinaries) -> Self {
         let mut caps = Self::default();
 
@@ -71,7 +173,8 @@ impl MediaCapabilities {
             }
         }
 
-        // 2. Detect encoders
+        // 2. Detect encoders compiled into FFmpeg
+        let mut candidate_hw_video = Vec::new();
         let mut enc_cmd = Command::new(&binaries.ffmpeg_path);
         enc_cmd.args(["-hide_banner", "-encoders"]);
         configure_background_command(&mut enc_cmd);
@@ -103,15 +206,8 @@ impl MediaCapabilities {
                 if !is_video && !is_audio {
                     continue;
                 }
-                let is_hardware = name.contains("videotoolbox")
-                    || name.contains("nvenc")
-                    || name.contains("qsv")
-                    || name.contains("vaapi")
-                    || name.contains("amf")
-                    || name.contains("mf")
-                    || name.ends_with("_at");
+                let is_hardware = is_hardware_encoder_name(name);
 
-                caps.encoder_names.insert(name.to_string());
                 let info = EncoderInfo {
                     name: name.to_string(),
                     description: desc,
@@ -119,12 +215,67 @@ impl MediaCapabilities {
                     is_hardware,
                 };
                 if is_video {
-                    caps.video_encoders.push(info);
+                    if is_hardware {
+                        // Only probe primary hardware encoders we expose (or vendor GPU families)
+                        if PREFERRED_VIDEO_ENCODERS.contains(&name) {
+                            candidate_hw_video.push(info);
+                        }
+                    } else {
+                        caps.encoder_names.insert(name.to_string());
+                        caps.video_encoders.push(info);
+                    }
                 } else {
+                    caps.encoder_names.insert(name.to_string());
                     caps.audio_encoders.push(info);
                 }
             }
         }
+
+        // 2b. Probe candidate hardware video encoders in parallel to verify actual GPU/APU support
+        if !candidate_hw_video.is_empty() {
+            let ffmpeg_path = binaries.ffmpeg_path.as_path();
+            let supported_hw: Vec<EncoderInfo> = std::thread::scope(|scope| {
+                let handles: Vec<_> = candidate_hw_video
+                    .into_iter()
+                    .map(|info| {
+                        scope.spawn(move || {
+                            let ok = probe_hardware_video_encoder(ffmpeg_path, &info.name);
+                            debug!(
+                                encoder = %info.name,
+                                available = ok,
+                                "Probed hardware video encoder on host system"
+                            );
+                            ok.then_some(info)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .filter_map(|h| h.join().ok().flatten())
+                    .collect()
+            });
+
+            for info in supported_hw {
+                caps.encoder_names.insert(info.name.clone());
+                caps.video_encoders.push(info);
+            }
+        }
+
+        // Prune hwaccels whose corresponding vendor hardware encoders are all unavailable
+        let has_nvenc = caps.encoder_names.iter().any(|n| n.ends_with("_nvenc"));
+        let has_qsv = caps.encoder_names.iter().any(|n| n.ends_with("_qsv"));
+        let has_vaapi = caps.encoder_names.iter().any(|n| n.ends_with("_vaapi"));
+        let has_videotoolbox = caps
+            .encoder_names
+            .iter()
+            .any(|n| n.ends_with("_videotoolbox"));
+        caps.hwaccels.retain(|hw| match hw.as_str() {
+            "cuda" | "nvdec" | "cuvid" => has_nvenc,
+            "qsv" => has_qsv,
+            "vaapi" => has_vaapi,
+            "videotoolbox" => has_videotoolbox,
+            _ => true,
+        });
 
         // 3. Detect external VVenC (libvvenc / vvencapp) H.266/VVC encoder if installed on the system
         if binaries.vvencapp_path.as_deref().is_some_and(|path|
@@ -157,29 +308,11 @@ impl MediaCapabilities {
         self.encoder_names.contains(name)
     }
 
-    /// Returns a curated list of primary video encoders present in this FFmpeg build,
+    /// Returns a curated list of primary video encoders verified to be available on this system,
     /// followed by any other relevant hardware/software encoders.
     pub fn preferred_video_encoders(&self) -> Vec<EncoderInfo> {
-        let priority = [
-            "libx264",
-            "h264_videotoolbox",
-            "h264_nvenc",
-            "h264_vaapi",
-            "h264_qsv",
-            "libx265",
-            "hevc_videotoolbox",
-            "hevc_nvenc",
-            "libvvenc",
-            "libsvtav1",
-            "libaom-av1",
-            "libvpx-vp9",
-            "prores_ks",
-            "prores_videotoolbox",
-            "ffv1",
-            "mpeg4",
-        ];
         let mut out = Vec::new();
-        for name in priority {
+        for &name in PREFERRED_VIDEO_ENCODERS {
             if let Some(enc) = self.video_encoders.iter().find(|e| e.name == name) {
                 out.push(enc.clone());
             }
@@ -1287,5 +1420,43 @@ mod tests {
             .expect("Failed to decode filtered frame");
         assert_eq!(filtered.width, 160);
         assert_eq!(filtered.height, 120);
+    }
+
+    #[test]
+    fn preferred_video_encoders_includes_amd_amf_and_verified_hw_only() {
+        let mut caps = MediaCapabilities::default();
+        for (name, desc, is_hardware) in [
+            ("libx264", "libx264 H.264", false),
+            ("h264_amf", "AMD AMF H.264 Encoder", true),
+            ("libx265", "libx265 H.265", false),
+            ("hevc_amf", "AMD AMF HEVC encoder", true),
+            ("av1_amf", "AMD AMF AV1 encoder", true),
+        ] {
+            caps.encoder_names.insert(name.to_string());
+            caps.video_encoders.push(EncoderInfo {
+                name: name.to_string(),
+                description: desc.to_string(),
+                is_video: true,
+                is_hardware,
+            });
+        }
+
+        let preferred: Vec<String> = caps
+            .preferred_video_encoders()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(preferred.contains(&"h264_amf".to_string()));
+        assert!(preferred.contains(&"hevc_amf".to_string()));
+        assert!(preferred.contains(&"av1_amf".to_string()));
+        assert!(!preferred.contains(&"h264_nvenc".to_string()));
+        assert!(!preferred.contains(&"h264_qsv".to_string()));
+
+        let bins = FfmpegBinaries::discover(None, None).expect("FFmpeg must be installed");
+        // Non-existent / unsupported hardware encoder must return false on runtime probe
+        assert!(!probe_hardware_video_encoder(
+            &bins.ffmpeg_path,
+            "nonexistent_hw_encoder"
+        ));
     }
 }

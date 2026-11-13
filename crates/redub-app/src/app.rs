@@ -188,7 +188,15 @@ impl CutDubApp {
         });
 
         let mut export_settings = ExportSettings::default();
-        if let Some(first_enc) = capabilities.preferred_video_encoders().first() {
+        export_settings.use_hwaccel_decode =
+            !capabilities.hwaccels.is_empty() && settings.prefer_hardware_decode;
+        if let Some(saved_enc) = settings
+            .last_video_encoder
+            .as_deref()
+            .filter(|enc| capabilities.has_encoder(enc))
+        {
+            export_settings.apply_recommended_defaults_for_encoder(saved_enc);
+        } else if let Some(first_enc) = capabilities.preferred_video_encoders().first() {
             export_settings.video_encoder = first_enc.name.clone();
         }
 
@@ -4181,17 +4189,33 @@ impl CutDubApp {
                     if let Some(new_enc) = picked_encoder {
                         self.export_settings
                             .apply_recommended_defaults_for_encoder(&new_enc);
+                        self.settings.last_video_encoder = Some(new_enc);
+                        let _ = self.settings.save(&self.paths);
                     }
 
-                    let cpus = std::thread::available_parallelism()
-                        .map(|n| n.get())
-                        .unwrap_or(8);
+                    let enc_name = self.export_settings.video_encoder.as_str();
+                    let accel_label = if enc_name.ends_with("_amf") {
+                        "⚡ Hardware-accelerated GPU encoding active (AMD AMF)".to_string()
+                    } else if enc_name.ends_with("_nvenc") {
+                        "⚡ Hardware-accelerated GPU encoding active (NVIDIA NVENC)".to_string()
+                    } else if enc_name.ends_with("_qsv") {
+                        "⚡ Hardware-accelerated GPU encoding active (Intel QuickSync QSV)"
+                            .to_string()
+                    } else if enc_name.ends_with("_videotoolbox") {
+                        "⚡ Hardware-accelerated GPU encoding active (Apple VideoToolbox)"
+                            .to_string()
+                    } else if enc_name.ends_with("_vaapi") {
+                        "⚡ Hardware-accelerated GPU encoding active (VA-API)".to_string()
+                    } else {
+                        let cpus = std::thread::available_parallelism()
+                            .map(|n| n.get())
+                            .unwrap_or(8);
+                        format!("⚡ Multi-core parallel encoding active ({cpus} CPU threads)")
+                    };
                     ui.label(
-                        RichText::new(format!(
-                            "⚡ Multi-core parallel encoding active ({cpus} CPU threads)"
-                        ))
-                        .size(11.0)
-                        .color(Color32::from_rgb(125, 205, 160)),
+                        RichText::new(accel_label)
+                            .size(11.0)
+                            .color(Color32::from_rgb(125, 205, 160)),
                     );
 
                     ui.horizontal(|ui| {
@@ -4289,27 +4313,77 @@ impl CutDubApp {
                         }
                     }
 
-                    egui::ComboBox::from_id_salt("enc_preset_combo")
-                        .selected_text(format!("Speed Preset: {}", self.export_settings.encoder_preset))
-                        .show_ui(ui, |ui| {
-                            for p in [
-                                "ultrafast",
-                                "superfast",
-                                "veryfast",
-                                "faster",
-                                "fast",
-                                "medium",
-                                "slow",
-                                "slower",
-                                "veryslow",
-                            ] {
-                                ui.selectable_value(
-                                    &mut self.export_settings.encoder_preset,
-                                    p.to_string(),
-                                    p,
-                                );
-                            }
-                        });
+                    if enc_name.ends_with("_videotoolbox") {
+                        ui.label(
+                            RichText::new("Speed Preset: Hardware-managed (VideoToolbox)")
+                                .size(12.0)
+                                .color(Color32::GRAY),
+                        );
+                    } else if enc_name.ends_with("_amf") {
+                        let amf_label = match self.export_settings.encoder_preset.as_str() {
+                            "ultrafast" | "superfast" | "veryfast" | "faster" | "fast" => "Speed",
+                            "medium" => "Balanced",
+                            _ => "Quality",
+                        };
+                        egui::ComboBox::from_id_salt("enc_preset_combo")
+                            .selected_text(format!("Quality Preset: {amf_label}"))
+                            .show_ui(ui, |ui| {
+                                for (val, label) in [
+                                    ("fast", "Speed (fastest)"),
+                                    ("medium", "Balanced"),
+                                    ("slow", "Quality (best)"),
+                                ] {
+                                    ui.selectable_value(
+                                        &mut self.export_settings.encoder_preset,
+                                        val.to_string(),
+                                        label,
+                                    );
+                                }
+                            });
+                    } else if enc_name.ends_with("_nvenc") {
+                        let nv_label = match self.export_settings.encoder_preset.as_str() {
+                            "ultrafast" | "superfast" | "veryfast" | "faster" | "fast" => "Fast",
+                            "medium" => "Medium",
+                            _ => "Slow (Quality)",
+                        };
+                        egui::ComboBox::from_id_salt("enc_preset_combo")
+                            .selected_text(format!("Quality Preset: {nv_label}"))
+                            .show_ui(ui, |ui| {
+                                for (val, label) in [
+                                    ("fast", "Fast"),
+                                    ("medium", "Medium"),
+                                    ("slow", "Slow (Quality)"),
+                                ] {
+                                    ui.selectable_value(
+                                        &mut self.export_settings.encoder_preset,
+                                        val.to_string(),
+                                        label,
+                                    );
+                                }
+                            });
+                    } else {
+                        egui::ComboBox::from_id_salt("enc_preset_combo")
+                            .selected_text(format!("Speed Preset: {}", self.export_settings.encoder_preset))
+                            .show_ui(ui, |ui| {
+                                for p in [
+                                    "ultrafast",
+                                    "superfast",
+                                    "veryfast",
+                                    "faster",
+                                    "fast",
+                                    "medium",
+                                    "slow",
+                                    "slower",
+                                    "veryslow",
+                                ] {
+                                    ui.selectable_value(
+                                        &mut self.export_settings.encoder_preset,
+                                        p.to_string(),
+                                        p,
+                                    );
+                                }
+                            });
+                    }
 
                     ui.checkbox(
                         &mut self.export_settings.use_hwaccel_decode,

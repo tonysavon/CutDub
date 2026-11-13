@@ -2646,7 +2646,7 @@ dependencies = [
 
 [[package]]
 name = "redub-app"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "eframe",
@@ -2667,7 +2667,7 @@ dependencies = [
 
 [[package]]
 name = "redub-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "serde",
@@ -2679,7 +2679,7 @@ dependencies = [
 
 [[package]]
 name = "redub-export"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "redub-core",
@@ -2695,7 +2695,7 @@ dependencies = [
 
 [[package]]
 name = "redub-filters"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -2704,7 +2704,7 @@ dependencies = [
 
 [[package]]
 name = "redub-media"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "redub-core",
@@ -2718,7 +2718,7 @@ dependencies = [
 
 [[package]]
 name = "redub-platform"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "directories",
@@ -2731,7 +2731,7 @@ dependencies = [
 
 [[package]]
 name = "redub-preview"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "redub-core",
