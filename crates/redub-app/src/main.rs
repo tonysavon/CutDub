@@ -17,7 +17,8 @@ fn main() -> ExitCode {
         )
         .init();
 
-    let args: Vec<String> = env::args().collect();
+    // Ignore macOS Finder process serial number flags (`-psn_*`) when launched as a `.app` bundle
+    let args: Vec<String> = env::args().filter(|a| !a.starts_with("-psn_")).collect();
     if args.iter().any(|a| a == "--version" || a == "-V") {
         println!("CutDub (ReDub) {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;

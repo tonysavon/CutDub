@@ -6,4 +6,5 @@
 # Local FFmpeg checkout and packaged builds
 /FFmpeg/
 /releases/
+/dist/
 /.vscode/

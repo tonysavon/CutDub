@@ -3,6 +3,8 @@
 //! RGBA frame processing for real-time dual-panel Output preview.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RotationAngle {
@@ -446,6 +448,34 @@ pub enum FilterKind {
         subtitle_path: String,
         font_size: u32,
     },
+    /// Interactive DeLogo / Watermark remover (`delogo` filter with perimeter interpolation).
+    Delogo {
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        show_border: bool,
+    },
+    /// Image Overlay / Logo watermark (`movie` + `overlay` filter).
+    LogoOverlay {
+        image_path: String,
+        x: i32,
+        y: i32,
+        scale_pct: f32,
+        opacity: f32,
+        position: OverlayPosition,
+    },
+    /// 3D LUT Color Grading (`.cube` / `.3dl` via FFmpeg `lut3d`).
+    Lut3d {
+        lut_path: String,
+    },
+    /// Handheld Camera Video Stabilizer (FFmpeg `deshake`).
+    Deshake {
+        rx: u32,
+        ry: u32,
+        edge_mirror: bool,
+        blocksize: u32,
+    },
 }
 
 impl FilterKind {
@@ -526,6 +556,10 @@ impl FilterKind {
             Self::FieldSwap => "Field Swap (Even/Odd Scanlines)",
             Self::TextOverlay { .. } => "Text / Timecode Overlay",
             Self::SubtitleBurnIn { .. } => "Subtitle Burn-In (Hardsubs)",
+            Self::Delogo { .. } => "DeLogo / Watermark Remover",
+            Self::LogoOverlay { .. } => "Logo / Image Watermark",
+            Self::Lut3d { .. } => "3D LUT (.cube Color Grade)",
+            Self::Deshake { .. } => "Stabilize (Deshake)",
         }
     }
 
@@ -684,6 +718,53 @@ impl FilterKind {
                     format!("{subtitle_path} ({font_size}pt)")
                 }
             }
+            Self::Delogo {
+                x,
+                y,
+                width,
+                height,
+                ..
+            } => format!("Rect {width}×{height} @ ({x},{y})"),
+            Self::LogoOverlay {
+                image_path,
+                scale_pct,
+                opacity,
+                position,
+                ..
+            } => {
+                let fname = std::path::Path::new(image_path.trim())
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("(no file)");
+                format!(
+                    "{fname} ({:.0}%, {:.0}% op, {})",
+                    scale_pct,
+                    opacity * 100.0,
+                    position.label()
+                )
+            }
+            Self::Lut3d { lut_path } => {
+                if lut_path.trim().is_empty() {
+                    "(no .cube selected)".to_string()
+                } else {
+                    std::path::Path::new(lut_path.trim())
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(lut_path)
+                        .to_string()
+                }
+            }
+            Self::Deshake {
+                rx,
+                ry,
+                edge_mirror,
+                ..
+            } => format!(
+                "Range {}×{} ({})",
+                rx,
+                ry,
+                if *edge_mirror { "Mirror" } else { "Clamp" }
+            ),
         }
     }
 
@@ -1100,8 +1181,98 @@ impl FilterKind {
                     current_h,
                 ))
             }
+            Self::Delogo {
+                x,
+                y,
+                width,
+                height,
+                show_border,
+            } => {
+                if current_w < 6 || current_h < 6 {
+                    return None;
+                }
+                let x0 = (*x).clamp(1, current_w.saturating_sub(3).max(1));
+                let y0 = (*y).clamp(1, current_h.saturating_sub(3).max(1));
+                let max_w = current_w.saturating_sub(x0 + 1).max(1);
+                let max_h = current_h.saturating_sub(y0 + 1).max(1);
+                let w = (*width).clamp(2, max_w);
+                let h = (*height).clamp(2, max_h);
+                Some((
+                    format!(
+                        "delogo=x={x0}:y={y0}:w={w}:h={h}:show={}",
+                        if *show_border { 1 } else { 0 }
+                    ),
+                    current_w,
+                    current_h,
+                ))
+            }
+            Self::LogoOverlay {
+                image_path,
+                x,
+                y,
+                scale_pct,
+                opacity,
+                position,
+            } => {
+                let p = image_path.trim();
+                if p.is_empty() {
+                    return None;
+                }
+                let escaped = escape_ffmpeg_filter_path(p);
+                let scale = (*scale_pct / 100.0).clamp(0.05, 4.0);
+                let alpha = (*opacity).clamp(0.0, 1.0);
+                let (x_ex, y_ex) = match position {
+                    OverlayPosition::TopLeft => (format!("{x}"), format!("{y}")),
+                    OverlayPosition::TopCenter => (format!("(W-w)/2+{x}"), format!("{y}")),
+                    OverlayPosition::TopRight => (format!("W-w-{x}"), format!("{y}")),
+                    OverlayPosition::BottomLeft => (format!("{x}"), format!("H-h-{y}")),
+                    OverlayPosition::BottomCenter => (format!("(W-w)/2+{x}"), format!("H-h-{y}")),
+                    OverlayPosition::BottomRight => (format!("W-w-{x}"), format!("H-h-{y}")),
+                };
+                Some((
+                    format!(
+                        "null[cutdub_base];movie='{escaped}',scale=iw*{scale:.3}:-1,format=rgba,colorchannelmixer=aa={alpha:.3}[cutdub_logo];[cutdub_base][cutdub_logo]overlay=x={x_ex}:y={y_ex}:eof_action=repeat"
+                    ),
+                    current_w,
+                    current_h,
+                ))
+            }
+            Self::Lut3d { lut_path } => {
+                let p = lut_path.trim();
+                if p.is_empty() {
+                    return None;
+                }
+                let escaped = escape_ffmpeg_filter_path(p);
+                Some((
+                    format!("lut3d=file='{escaped}':interp=tetrahedral"),
+                    current_w,
+                    current_h,
+                ))
+            }
+            Self::Deshake {
+                rx,
+                ry,
+                edge_mirror,
+                blocksize,
+            } => {
+                let rx_c = (*rx).clamp(4, 64);
+                let ry_c = (*ry).clamp(4, 64);
+                let bs = (*blocksize).clamp(4, 64);
+                let edge = if *edge_mirror { "mirror" } else { "clamp" };
+                Some((
+                    format!("deshake=rx={rx_c}:ry={ry_c}:edge={edge}:blocksize={bs}"),
+                    current_w,
+                    current_h,
+                ))
+            }
         }
     }
+}
+
+fn escape_ffmpeg_filter_path(path: &str) -> String {
+    path.replace('\\', "\\\\")
+        .replace(':', "\\:")
+        .replace('\'', "'\\''")
 }
 
 fn default_true() -> bool {
@@ -1194,7 +1365,12 @@ impl FilterPipeline {
             if !instance.enabled {
                 continue;
             }
-            if let Some((expr, next_w, next_h)) = instance.kind.to_ffmpeg_expr(cur_w, cur_h) {
+            if let Some((mut expr, next_w, next_h)) = instance.kind.to_ffmpeg_expr(cur_w, cur_h) {
+                if expr.contains("cutdub_base") {
+                    expr = expr
+                        .replace("cutdub_base", &format!("cutdub_base_{}", instance.id))
+                        .replace("cutdub_logo", &format!("cutdub_logo_{}", instance.id));
+                }
                 exprs.push(expr);
                 cur_w = next_w;
                 cur_h = next_h;
@@ -1925,6 +2101,55 @@ impl FilterPipeline {
                         );
                     }
                 }
+                FilterKind::Delogo {
+                    x,
+                    y,
+                    width: rw,
+                    height: rh,
+                    show_border,
+                } => {
+                    apply_delogo_rgba(
+                        &mut pixels,
+                        width,
+                        height,
+                        *x,
+                        *y,
+                        *rw,
+                        *rh,
+                        *show_border,
+                    );
+                }
+                FilterKind::LogoOverlay {
+                    image_path,
+                    opacity,
+                    position,
+                    ..
+                } => {
+                    if !image_path.trim().is_empty() {
+                        let file_name = std::path::Path::new(image_path.trim())
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("Logo");
+                        let label = format!("LOGO: {file_name} ({:.0}%)", opacity * 100.0);
+                        draw_bitmap_banner(
+                            &mut pixels,
+                            width,
+                            height,
+                            &label,
+                            *position,
+                            18,
+                            opacity.clamp(0.25, 0.9),
+                        );
+                    }
+                }
+                FilterKind::Lut3d { lut_path } => {
+                    if !lut_path.trim().is_empty() {
+                        apply_cube_lut_rgba(&mut pixels, lut_path.trim());
+                    }
+                }
+                FilterKind::Deshake { .. } => {
+                    // Temporal multi-frame stabilization runs in FFmpeg export; preview stays unaltered.
+                }
             }
         }
         (width, height, pixels)
@@ -1942,6 +2167,185 @@ impl FilterPipeline {
             }
         }
         factor.clamp(0.1, 8.0)
+    }
+}
+
+/// Bilinear perimeter-interpolated watermark / logo removal preview matching FFmpeg's `delogo`.
+fn apply_delogo_rgba(
+    pixels: &mut [u8],
+    width: u32,
+    height: u32,
+    x: u32,
+    y: u32,
+    rw: u32,
+    rh: u32,
+    show_border: bool,
+) {
+    if width < 6 || height < 6 {
+        return;
+    }
+    let x0 = x.clamp(1, width.saturating_sub(3));
+    let y0 = y.clamp(1, height.saturating_sub(3));
+    let w = rw.clamp(2, width.saturating_sub(x0 + 1));
+    let h = rh.clamp(2, height.saturating_sub(y0 + 1));
+
+    let stride = width as usize * 4;
+    for py in y0..(y0 + h) {
+        let v = (py - y0 + 1) as f32 / (h + 1) as f32;
+        let dy = ((py - y0 + 1).min(y0 + h - py)) as f32;
+        let left_off = py as usize * stride + (x0 - 1) as usize * 4;
+        let right_off = py as usize * stride + (x0 + w) as usize * 4;
+        let row_off = py as usize * stride;
+        for px in x0..(x0 + w) {
+            let u = (px - x0 + 1) as f32 / (w + 1) as f32;
+            let dx = ((px - x0 + 1).min(x0 + w - px)) as f32;
+            let top_off = (y0 - 1) as usize * stride + px as usize * 4;
+            let bot_off = (y0 + h) as usize * stride + px as usize * 4;
+
+            let wh = 1.0 / dx;
+            let wv = 1.0 / dy;
+            let w_sum = wh + wv;
+            let dst_off = row_off + px as usize * 4;
+            for c in 0..3 {
+                let h_val =
+                    pixels[left_off + c] as f32 * (1.0 - u) + pixels[right_off + c] as f32 * u;
+                let v_val =
+                    pixels[top_off + c] as f32 * (1.0 - v) + pixels[bot_off + c] as f32 * v;
+                let blended = (h_val * wh + v_val * wv) / w_sum;
+                pixels[dst_off + c] = blended.round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+
+    if show_border {
+        let bx0 = x0.saturating_sub(1);
+        let by0 = y0.saturating_sub(1);
+        let bx1 = (x0 + w).min(width - 1);
+        let by1 = (y0 + h).min(height - 1);
+        for px in bx0..=bx1 {
+            for &py in &[by0, by1] {
+                let off = py as usize * stride + px as usize * 4;
+                pixels[off] = 60;
+                pixels[off + 1] = 240;
+                pixels[off + 2] = 220;
+            }
+        }
+        for py in by0..=by1 {
+            for &px in &[bx0, bx1] {
+                let off = py as usize * stride + px as usize * 4;
+                pixels[off] = 60;
+                pixels[off + 1] = 240;
+                pixels[off + 2] = 220;
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CachedCubeLut {
+    size: usize,
+    table: Vec<[f32; 3]>,
+}
+
+fn load_cached_cube_lut(path: &str) -> Option<CachedCubeLut> {
+    static LUT_CACHE: OnceLock<Mutex<HashMap<String, Option<CachedCubeLut>>>> = OnceLock::new();
+    let cache = LUT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some(hit) = guard.get(path) {
+            return hit.clone();
+        }
+    }
+
+    let parsed = std::fs::read_to_string(path).ok().and_then(|text| {
+        let mut size = 0usize;
+        let mut table = Vec::new();
+        for raw in text.lines() {
+            let line = raw.split('#').next().unwrap_or("").trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("LUT_3D_SIZE") {
+                size = rest.trim().parse::<usize>().ok()?;
+                if !(2..=129).contains(&size) {
+                    return None;
+                }
+                table.reserve(size * size * size);
+                continue;
+            }
+            if line.starts_with("TITLE")
+                || line.starts_with("DOMAIN_")
+                || line.starts_with("LUT_1D_")
+            {
+                continue;
+            }
+            let mut nums = line.split_whitespace();
+            if let (Some(rs), Some(gs), Some(bs), None) =
+                (nums.next(), nums.next(), nums.next(), nums.next())
+            {
+                if let (Ok(r), Ok(g), Ok(b)) =
+                    (rs.parse::<f32>(), gs.parse::<f32>(), bs.parse::<f32>())
+                {
+                    table.push([r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0)]);
+                }
+            }
+        }
+        if size >= 2 && table.len() >= size * size * size {
+            Some(CachedCubeLut { size, table })
+        } else {
+            None
+        }
+    });
+
+    if let Ok(mut guard) = cache.lock() {
+        if guard.len() > 16 {
+            guard.clear();
+        }
+        guard.insert(path.to_string(), parsed.clone());
+    }
+    parsed
+}
+
+fn apply_cube_lut_rgba(pixels: &mut [u8], path: &str) {
+    let Some(lut) = load_cached_cube_lut(path) else {
+        return;
+    };
+    let n = lut.size;
+    let max_idx = (n - 1) as f32;
+    for chunk in pixels.chunks_exact_mut(4) {
+        let rf = (chunk[0] as f32 / 255.0) * max_idx;
+        let gf = (chunk[1] as f32 / 255.0) * max_idx;
+        let bf = (chunk[2] as f32 / 255.0) * max_idx;
+
+        let r0 = (rf.floor() as usize).min(n - 2);
+        let g0 = (gf.floor() as usize).min(n - 2);
+        let b0 = (bf.floor() as usize).min(n - 2);
+        let r1 = r0 + 1;
+        let g1 = g0 + 1;
+        let b1 = b0 + 1;
+        let tr = rf - r0 as f32;
+        let tg = gf - g0 as f32;
+        let tb = bf - b0 as f32;
+
+        let idx = |r: usize, g: usize, b: usize| -> [f32; 3] { lut.table[r + g * n + b * n * n] };
+        let c000 = idx(r0, g0, b0);
+        let c100 = idx(r1, g0, b0);
+        let c010 = idx(r0, g1, b0);
+        let c110 = idx(r1, g1, b0);
+        let c001 = idx(r0, g0, b1);
+        let c101 = idx(r1, g0, b1);
+        let c011 = idx(r0, g1, b1);
+        let c111 = idx(r1, g1, b1);
+
+        for c in 0..3 {
+            let c00 = c000[c] * (1.0 - tr) + c100[c] * tr;
+            let c10 = c010[c] * (1.0 - tr) + c110[c] * tr;
+            let c01 = c001[c] * (1.0 - tr) + c101[c] * tr;
+            let c11 = c011[c] * (1.0 - tr) + c111[c] * tr;
+            let c0 = c00 * (1.0 - tg) + c10 * tg;
+            let c1 = c01 * (1.0 - tg) + c11 * tg;
+            let out = c0 * (1.0 - tb) + c1 * tb;
+            chunk[c] = (out * 255.0).round().clamp(0.0, 255.0) as u8;
+        }
     }
 }
 
@@ -2269,5 +2673,64 @@ mod tests {
             "Missing `is_open` should default to true"
         );
         assert_eq!(deserialized.kind.summary(), "L:10 T:20 R:30 B:40");
+    }
+
+    #[test]
+    fn delogo_logo_lut_and_deshake_generate_expected_filtergraphs() {
+        let mut pipe = FilterPipeline::new();
+        pipe.add(FilterKind::Delogo {
+            x: 20,
+            y: 30,
+            width: 100,
+            height: 40,
+            show_border: false,
+        });
+        pipe.add(FilterKind::LogoOverlay {
+            image_path: "/tmp/logo.png".into(),
+            x: 16,
+            y: 12,
+            scale_pct: 50.0,
+            opacity: 0.75,
+            position: OverlayPosition::BottomRight,
+        });
+        pipe.add(FilterKind::Lut3d {
+            lut_path: "/tmp/grade.cube".into(),
+        });
+        pipe.add(FilterKind::Deshake {
+            rx: 16,
+            ry: 16,
+            edge_mirror: true,
+            blocksize: 8,
+        });
+        let (fg, w, h) = pipe.to_ffmpeg_filtergraph(1280, 720);
+        let fg = fg.expect("filtergraph should not be empty");
+        assert_eq!((w, h), (1280, 720));
+        assert!(fg.contains("delogo=x=20:y=30:w=100:h=40:show=0"));
+        assert!(fg.contains("overlay=x=W-w-16:y=H-h-12:eof_action=repeat"));
+        assert!(fg.contains("lut3d=file='/tmp/grade.cube':interp=tetrahedral"));
+        assert!(fg.contains("deshake=rx=16:ry=16:edge=mirror:blocksize=8"));
+
+        // Verify DeLogo RGBA inpainting actually modifies center of a contrasting square smoothly
+        let mut rgba = vec![200u8; 32 * 32 * 4];
+        for py in 10..20usize {
+            for px in 10..20usize {
+                let off = (py * 32 + px) * 4;
+                rgba[off] = 10;
+                rgba[off + 1] = 10;
+                rgba[off + 2] = 10;
+                rgba[off + 3] = 255;
+            }
+        }
+        let mut delogo_only = FilterPipeline::new();
+        delogo_only.add(FilterKind::Delogo {
+            x: 10,
+            y: 10,
+            width: 10,
+            height: 10,
+            show_border: false,
+        });
+        let (_, _, out) = delogo_only.apply_to_rgba(32, 32, rgba);
+        let center = (15 * 32 + 15) * 4;
+        assert_eq!(out[center], 200);
     }
 }

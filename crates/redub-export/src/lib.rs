@@ -594,6 +594,43 @@ pub fn audio_bitrate_profile(
     }
 }
 
+/// Output video pixel format / bit depth and chroma subsampling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum VideoPixelFormat {
+    #[default]
+    Yuv420p,
+    Yuv420p10le,
+    Yuv422p10le,
+    Yuv444p,
+}
+
+impl VideoPixelFormat {
+    pub const ALL: [Self; 4] = [
+        Self::Yuv420p,
+        Self::Yuv420p10le,
+        Self::Yuv422p10le,
+        Self::Yuv444p,
+    ];
+
+    pub fn ffmpeg_name(self) -> &'static str {
+        match self {
+            Self::Yuv420p => "yuv420p",
+            Self::Yuv420p10le => "yuv420p10le",
+            Self::Yuv422p10le => "yuv422p10le",
+            Self::Yuv444p => "yuv444p",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Yuv420p => "8-bit 4:2:0 (yuv420p — Maximum Compatibility)",
+            Self::Yuv420p10le => "10-bit 4:2:0 (yuv420p10le — HDR / Banding-Free)",
+            Self::Yuv422p10le => "10-bit 4:2:2 (yuv422p10le — Broadcast / Grading)",
+            Self::Yuv444p => "8-bit 4:4:4 (yuv444p — Crisp Text / Screen Capture)",
+        }
+    }
+}
+
 /// Complete configuration for an export job or saved preset.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExportSettings {
@@ -614,6 +651,10 @@ pub struct ExportSettings {
     pub custom_fps: Option<f64>,
     pub use_hwaccel_decode: bool,
     pub preserve_metadata: bool,
+    #[serde(default)]
+    pub pixel_format: VideoPixelFormat,
+    #[serde(default)]
+    pub two_pass: bool,
     #[serde(default)]
     pub audio_processing_mode: AudioProcessingMode,
     #[serde(default = "default_audio_encoder")]
@@ -647,6 +688,8 @@ impl Default for ExportSettings {
             custom_fps: None,
             use_hwaccel_decode: false,
             preserve_metadata: true,
+            pixel_format: VideoPixelFormat::Yuv420p,
+            two_pass: false,
             audio_processing_mode: AudioProcessingMode::DirectStreamCopy,
             audio_encoder: "aac".to_string(),
             audio_bitrate_kbps: 192,
@@ -659,6 +702,13 @@ impl Default for ExportSettings {
 }
 
 impl ExportSettings {
+    /// Returns true if the currently selected video encoder + rate-control mode supports true 2-pass encoding.
+    pub fn supports_two_pass(&self) -> bool {
+        matches!(
+            self.video_encoder.as_str(),
+            "libx264" | "libx265" | "libvpx-vp9" | "libaom-av1"
+        ) && self.rate_control_mode != VideoRateControlMode::Crf
+    }
     pub fn encoders_available(&self, caps: &MediaCapabilities) -> bool {
         (self.processing_mode == VideoProcessingMode::DirectStreamCopy
             || caps.has_encoder(&self.video_encoder))
@@ -1349,6 +1399,312 @@ pub fn start_split_by_markers_export_job(
     })
 }
 
+fn active_export_segments(project: &Project, export_selection_only: bool) -> Vec<EditSegment> {
+    if export_selection_only {
+        if let Some((s, e)) = project.selection_range() {
+            let sub = project.segments_for_virtual_range(s, e);
+            if !sub.is_empty() {
+                return sub;
+            }
+        }
+    }
+    project.segments.clone()
+}
+
+/// Exports the active selection or full timeline as a palette-optimized Animated GIF (`palettegen`+`paletteuse`)
+/// or Animated WebP (`libwebp`).
+#[allow(clippy::too_many_arguments)]
+pub fn start_animated_gif_or_webp_export_job(
+    binaries: FfmpegBinaries,
+    project: Project,
+    filters: FilterPipeline,
+    export_selection_only: bool,
+    fps: u32,
+    max_width: u32,
+    loop_forever: bool,
+    output_path: PathBuf,
+) -> Result<ExportJobHandle, ExportError> {
+    let segs = active_export_segments(&project, export_selection_only);
+    if segs.is_empty() {
+        return Err(ExportError::EmptyTimeline);
+    }
+
+    let (tx, rx) = mpsc::channel::<ExportEvent>();
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let cancel_clone = Arc::clone(&cancel_flag);
+    let out_clone = output_path.clone();
+
+    thread::Builder::new()
+        .name("cutdub-gif-export-worker".into())
+        .spawn(move || {
+            let Some(first_src) = project.source_by_id(segs[0].source_id) else {
+                let _ = tx.send(ExportEvent::Failed(ExportError::EmptyTimeline.to_string()));
+                return;
+            };
+            let mut total_dur_us = 0i64;
+            let mut cmd = Command::new(&binaries.ffmpeg_path);
+            configure_background_command(&mut cmd);
+            cmd.args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-y",
+                "-progress",
+                "pipe:1",
+                "-nostats",
+            ]);
+
+            let mut concat_inputs = Vec::new();
+            for (i, seg) in segs.iter().enumerate() {
+                let Some(src) = project.source_by_id(seg.source_id) else {
+                    continue;
+                };
+                let start_pts = src.timing.frame_to_timestamp(seg.start_frame);
+                let end_pts = src.timing.frame_to_timestamp(seg.end_frame);
+                let dur_us = (end_pts.0 - start_pts.0).max(1_000);
+                total_dur_us += dur_us;
+                if start_pts.0 > 0 {
+                    cmd.arg("-ss")
+                        .arg(format!("{:.6}", start_pts.as_seconds_f64()));
+                }
+                cmd.arg("-t").arg(format!("{:.6}", dur_us as f64 / 1_000_000.0));
+                cmd.arg("-i").arg(&src.path);
+                concat_inputs.push(format!("[{i}:{}]", src.video_stream_index));
+            }
+            if concat_inputs.is_empty() {
+                let _ = tx.send(ExportEvent::Failed(ExportError::EmptyTimeline.to_string()));
+                return;
+            }
+
+            let speed = filters.effective_speed_factor();
+            let total_duration = TimestampUs(((total_dur_us as f64) / speed).round() as i64);
+            let base_vf = filters
+                .to_ffmpeg_filtergraph(first_src.width, first_src.height)
+                .0;
+            let fps_c = fps.clamp(1, 50);
+            let max_w = (max_width.clamp(64, 3840) & !1).max(64);
+            let anim_scale = format!("fps={fps_c},scale='min({max_w},iw)':-1:flags=lanczos");
+            let combined_vf = match base_vf {
+                Some(vf) => format!("{vf},{anim_scale}"),
+                None => anim_scale,
+            };
+
+            let is_webp = out_clone
+                .extension()
+                .and_then(|s| s.to_str())
+                .map(|s| s.eq_ignore_ascii_case("webp"))
+                .unwrap_or(false);
+
+            let filter_graph = if is_webp {
+                combined_vf
+            } else {
+                format!(
+                    "{combined_vf},split[cutdub_gs0][cutdub_gs1];[cutdub_gs0]palettegen=stats_mode=diff[cutdub_gp];[cutdub_gs1][cutdub_gp]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle"
+                )
+            };
+
+            if concat_inputs.len() == 1 {
+                cmd.args(["-map", &format!("0:{}", first_src.video_stream_index)]);
+                cmd.args(["-vf", &filter_graph]);
+            } else {
+                let n = concat_inputs.len();
+                let prefix = concat_inputs.join("");
+                let fc = format!("{prefix}concat=n={n}:v=1:a=0,{filter_graph}[cutdub_anim_out]");
+                cmd.args(["-filter_complex", &fc, "-map", "[cutdub_anim_out]"]);
+            }
+
+            if is_webp {
+                let loop_val = if loop_forever { "0" } else { "1" };
+                cmd.args([
+                    "-vcodec",
+                    "libwebp",
+                    "-lossless",
+                    "0",
+                    "-compression_level",
+                    "4",
+                    "-q:v",
+                    "75",
+                    "-loop",
+                    loop_val,
+                ]);
+            } else {
+                let loop_val = if loop_forever { "0" } else { "-1" };
+                cmd.args(["-loop", loop_val]);
+            }
+            cmd.args(["-an", "-sn"]);
+            cmd.arg(&out_clone);
+            cmd.stdout(Stdio::piped());
+            cmd.stderr(Stdio::piped());
+
+            match run_ffmpeg_with_progress(cmd, total_duration, TimestampUs::ZERO, &cancel_clone, &tx) {
+                Ok(()) => {
+                    let _ = tx.send(ExportEvent::Completed {
+                        output_path: out_clone,
+                        duration: total_duration,
+                    });
+                }
+                Err(ExportError::Cancelled) => {
+                    let _ = fs::remove_file(&out_clone);
+                    let _ = tx.send(ExportEvent::Cancelled);
+                }
+                Err(e) => {
+                    let _ = fs::remove_file(&out_clone);
+                    let _ = tx.send(ExportEvent::Failed(e.to_string()));
+                }
+            }
+        })
+        .map_err(ExportError::Io)?;
+
+    Ok(ExportJobHandle {
+        output_path,
+        receiver: rx,
+        cancel_flag,
+    })
+}
+
+/// Exports the active selection or full timeline as a numbered PNG or JPEG frame sequence
+/// (`{filename_prefix}_00001.{ext}`, ...).
+#[allow(clippy::too_many_arguments)]
+pub fn start_image_sequence_export_job(
+    binaries: FfmpegBinaries,
+    project: Project,
+    filters: FilterPipeline,
+    export_selection_only: bool,
+    ext: String,
+    output_dir: PathBuf,
+    filename_prefix: String,
+) -> Result<ExportJobHandle, ExportError> {
+    let segs = active_export_segments(&project, export_selection_only);
+    if segs.is_empty() {
+        return Err(ExportError::EmptyTimeline);
+    }
+
+    let clean_ext = if ext.eq_ignore_ascii_case("jpg") || ext.eq_ignore_ascii_case("jpeg") {
+        "jpg"
+    } else {
+        "png"
+    };
+    let sanitized_prefix: String = if filename_prefix.trim().is_empty() {
+        "frame".to_string()
+    } else {
+        filename_prefix
+            .trim()
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    };
+
+    let (tx, rx) = mpsc::channel::<ExportEvent>();
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let cancel_clone = Arc::clone(&cancel_flag);
+    let out_dir_clone = output_dir.clone();
+
+    thread::Builder::new()
+        .name("cutdub-imgseq-export-worker".into())
+        .spawn(move || {
+            let Some(first_src) = project.source_by_id(segs[0].source_id) else {
+                let _ = tx.send(ExportEvent::Failed(ExportError::EmptyTimeline.to_string()));
+                return;
+            };
+            let _ = fs::create_dir_all(&out_dir_clone);
+
+            let mut total_dur_us = 0i64;
+            let mut cmd = Command::new(&binaries.ffmpeg_path);
+            configure_background_command(&mut cmd);
+            cmd.args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-y",
+                "-progress",
+                "pipe:1",
+                "-nostats",
+            ]);
+
+            let mut concat_inputs = Vec::new();
+            for (i, seg) in segs.iter().enumerate() {
+                let Some(src) = project.source_by_id(seg.source_id) else {
+                    continue;
+                };
+                let start_pts = src.timing.frame_to_timestamp(seg.start_frame);
+                let end_pts = src.timing.frame_to_timestamp(seg.end_frame);
+                let dur_us = (end_pts.0 - start_pts.0).max(1_000);
+                total_dur_us += dur_us;
+                if start_pts.0 > 0 {
+                    cmd.arg("-ss")
+                        .arg(format!("{:.6}", start_pts.as_seconds_f64()));
+                }
+                cmd.arg("-t").arg(format!("{:.6}", dur_us as f64 / 1_000_000.0));
+                cmd.arg("-i").arg(&src.path);
+                concat_inputs.push(format!("[{i}:{}]", src.video_stream_index));
+            }
+            if concat_inputs.is_empty() {
+                let _ = tx.send(ExportEvent::Failed(ExportError::EmptyTimeline.to_string()));
+                return;
+            }
+
+            let speed = filters.effective_speed_factor();
+            let total_duration = TimestampUs(((total_dur_us as f64) / speed).round() as i64);
+            let base_vf = filters
+                .to_ffmpeg_filtergraph(first_src.width, first_src.height)
+                .0;
+
+            if concat_inputs.len() == 1 {
+                cmd.args(["-map", &format!("0:{}", first_src.video_stream_index)]);
+                if let Some(vf) = base_vf {
+                    cmd.args(["-vf", &vf]);
+                }
+            } else {
+                let n = concat_inputs.len();
+                let prefix = concat_inputs.join("");
+                let fc = match base_vf {
+                    Some(vf) => format!("{prefix}concat=n={n}:v=1:a=0,{vf}[cutdub_seq_out]"),
+                    None => format!("{prefix}concat=n={n}:v=1:a=0[cutdub_seq_out]"),
+                };
+                cmd.args(["-filter_complex", &fc, "-map", "[cutdub_seq_out]"]);
+            }
+
+            if clean_ext == "jpg" {
+                cmd.args(["-q:v", "2"]);
+            }
+            cmd.args(["-an", "-sn"]);
+            let pattern = out_dir_clone.join(format!("{sanitized_prefix}_%05d.{clean_ext}"));
+            cmd.arg(&pattern);
+            cmd.stdout(Stdio::piped());
+            cmd.stderr(Stdio::piped());
+
+            match run_ffmpeg_with_progress(cmd, total_duration, TimestampUs::ZERO, &cancel_clone, &tx) {
+                Ok(()) => {
+                    let _ = tx.send(ExportEvent::Completed {
+                        output_path: out_dir_clone,
+                        duration: total_duration,
+                    });
+                }
+                Err(ExportError::Cancelled) => {
+                    let _ = tx.send(ExportEvent::Cancelled);
+                }
+                Err(e) => {
+                    let _ = tx.send(ExportEvent::Failed(e.to_string()));
+                }
+            }
+        })
+        .map_err(ExportError::Io)?;
+
+    Ok(ExportJobHandle {
+        output_path: output_dir,
+        receiver: rx,
+        cancel_flag,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute_export(
     binaries: &FfmpegBinaries,
@@ -1525,6 +1881,26 @@ fn build_single_segment_command(
     settings: &ExportSettings,
     output_path: &Path,
 ) -> Result<Command, ExportError> {
+    build_single_segment_command_with_pass(
+        binaries,
+        project,
+        seg,
+        filters,
+        settings,
+        output_path,
+        None,
+    )
+}
+
+fn build_single_segment_command_with_pass(
+    binaries: &FfmpegBinaries,
+    project: &Project,
+    seg: &EditSegment,
+    filters: &FilterPipeline,
+    settings: &ExportSettings,
+    output_path: &Path,
+    two_pass: Option<(u8, &str)>,
+) -> Result<Command, ExportError> {
     let src = project
         .source_by_id(seg.source_id)
         .ok_or(ExportError::EmptyTimeline)?;
@@ -1639,6 +2015,7 @@ fn build_single_segment_command(
 
             // Apply quality / CRF or target bitrate, preset, and multi-core threading flags according to encoder family
             let enc = settings.video_encoder.as_str();
+            let pix_fmt = settings.pixel_format.ffmpeg_name();
             if enc == "libx264" {
                 cmd.args(["-threads", "0"]);
                 if let Some(kbps) = target_v_kbps {
@@ -1653,7 +2030,7 @@ fn build_single_segment_command(
                 } else {
                     cmd.args(["-crf", &settings.crf.to_string()]);
                 }
-                cmd.args(["-preset", &settings.encoder_preset, "-pix_fmt", "yuv420p"]);
+                cmd.args(["-preset", &settings.encoder_preset, "-pix_fmt", pix_fmt]);
             } else if enc == "libx265" {
                 cmd.args(["-threads", "0"]);
                 if let Some(kbps) = target_v_kbps {
@@ -1674,7 +2051,7 @@ fn build_single_segment_command(
                     "-x265-params",
                     "pools=+:frame-threads=0:wpp=1:no-sao=1:ctu=32:b-adapt=1",
                     "-pix_fmt",
-                    "yuv420p",
+                    pix_fmt,
                 ]);
                 if settings.container == ContainerFormat::Mp4
                     || settings.container == ContainerFormat::Mov
@@ -1702,7 +2079,7 @@ fn build_single_segment_command(
                     "-svtav1-params",
                     "lp=0",
                     "-pix_fmt",
-                    "yuv420p",
+                    pix_fmt,
                 ]);
             } else if enc == "libaom-av1" {
                 let cpu_used = match settings.encoder_preset.as_str() {
@@ -1733,7 +2110,7 @@ fn build_single_segment_command(
                     "-threads",
                     &logical_cpus.to_string(),
                     "-pix_fmt",
-                    "yuv420p",
+                    pix_fmt,
                 ]);
             } else if enc == "libvpx-vp9" {
                 let cpu_used = match settings.encoder_preset.as_str() {
@@ -1767,7 +2144,7 @@ fn build_single_segment_command(
                     "-cpu-used",
                     cpu_used,
                     "-pix_fmt",
-                    "yuv420p",
+                    pix_fmt,
                 ]);
             } else if enc == "libvvenc" {
                 let vvenc_preset = map_vvenc_preset(&settings.encoder_preset);
@@ -1786,7 +2163,7 @@ fn build_single_segment_command(
                     cmd.args(["-q:v", &q.to_string()]);
                 }
                 if !enc.starts_with("prores_") {
-                    cmd.args(["-pix_fmt", "yuv420p"]);
+                    cmd.args(["-pix_fmt", pix_fmt]);
                 }
                 if enc.contains("hevc")
                     && (settings.container == ContainerFormat::Mp4
@@ -1813,7 +2190,7 @@ fn build_single_segment_command(
                     let qp = settings.crf.clamp(0, 51).to_string();
                     cmd.args(["-rc", "cqp", "-qp_i", &qp, "-qp_p", &qp]);
                 }
-                cmd.args(["-quality", amf_quality, "-pix_fmt", "yuv420p"]);
+                cmd.args(["-quality", amf_quality, "-pix_fmt", pix_fmt]);
                 if enc.contains("hevc")
                     && (settings.container == ContainerFormat::Mp4
                         || settings.container == ContainerFormat::Mov)
@@ -1839,7 +2216,7 @@ fn build_single_segment_command(
                     let cq = settings.crf.clamp(0, 51).to_string();
                     cmd.args(["-rc", "vbr", "-cq", &cq, "-b:v", "0"]);
                 }
-                cmd.args(["-preset", nvenc_preset, "-pix_fmt", "yuv420p"]);
+                cmd.args(["-preset", nvenc_preset, "-pix_fmt", pix_fmt]);
                 if enc.contains("hevc")
                     && (settings.container == ContainerFormat::Mp4
                         || settings.container == ContainerFormat::Mov)
@@ -1898,13 +2275,33 @@ fn build_single_segment_command(
         }
     }
 
-    append_audio_and_subtitle_args(&mut cmd, 0, ext_audio_input_idx, project, filters, settings);
+    if let Some((pass_num, pass_prefix)) = two_pass {
+        cmd.args([
+            "-pass",
+            &pass_num.to_string(),
+            "-passlogfile",
+            pass_prefix,
+        ]);
+        if pass_num == 1 {
+            cmd.args(["-an", "-sn", "-f", "null", "-"]);
+        } else {
+            append_audio_and_subtitle_args(&mut cmd, 0, ext_audio_input_idx, project, filters, settings);
+            if settings.container == ContainerFormat::Mp4
+                || settings.container == ContainerFormat::Mov
+            {
+                cmd.args(["-movflags", "+faststart"]);
+            }
+            cmd.arg(output_path);
+        }
+    } else {
+        append_audio_and_subtitle_args(&mut cmd, 0, ext_audio_input_idx, project, filters, settings);
 
-    if settings.container == ContainerFormat::Mp4 || settings.container == ContainerFormat::Mov {
-        cmd.args(["-movflags", "+faststart"]);
+        if settings.container == ContainerFormat::Mp4 || settings.container == ContainerFormat::Mov {
+            cmd.args(["-movflags", "+faststart"]);
+        }
+
+        cmd.arg(output_path);
     }
-
-    cmd.arg(output_path);
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
@@ -2207,6 +2604,46 @@ fn execute_single_segment_task(
                 tx,
             );
         }
+    }
+
+    if settings.processing_mode != VideoProcessingMode::DirectStreamCopy
+        && settings.two_pass
+        && settings.supports_two_pass()
+    {
+        let pass_dir = tempfile::TempDir::new().map_err(ExportError::Io)?;
+        let pass_prefix = pass_dir
+            .path()
+            .join("cutdub_2pass")
+            .to_string_lossy()
+            .to_string();
+
+        let cmd_pass1 = build_single_segment_command_with_pass(
+            binaries,
+            project,
+            seg,
+            filters,
+            settings,
+            output_path,
+            Some((1, &pass_prefix)),
+        )?;
+        run_ffmpeg_with_progress(cmd_pass1, total_duration, base_completed, cancel_flag, tx)?;
+
+        let cmd_pass2 = build_single_segment_command_with_pass(
+            binaries,
+            project,
+            seg,
+            filters,
+            settings,
+            output_path,
+            Some((2, &pass_prefix)),
+        )?;
+        return run_ffmpeg_with_progress(
+            cmd_pass2,
+            total_duration,
+            base_completed,
+            cancel_flag,
+            tx,
+        );
     }
 
     let cmd = build_single_segment_command(
@@ -3299,5 +3736,106 @@ mod tests {
         settings.audio_bitrate_kbps = 320; // 320 is invalid for 24kHz MP3!
         settings.clamp_audio_bitrate(None, None);
         assert_eq!(settings.audio_bitrate_kbps, 160, "Must clamp to 160 kbps for 24kHz MP3");
+    }
+
+    #[test]
+    fn test_two_pass_10bit_gif_and_image_sequence_exports() {
+        let bins = FfmpegBinaries::discover(None, None).expect("FFmpeg must be installed");
+        let tmp = TempDir::new().unwrap();
+        let src_path = tmp.path().join("src.mp4");
+        generate_synthetic_video(&bins, &src_path, 160, 120, 15, 1.0, 5).unwrap();
+        let clip = probe_media_file(&bins, &src_path, true).unwrap();
+        let project = Project::from_primary_source(clip);
+
+        // 1. 2-Pass + 10-bit pixel format export
+        let two_pass_out = tmp.path().join("two_pass_10bit.mp4");
+        let settings_2p = ExportSettings {
+            processing_mode: VideoProcessingMode::FullProcessing,
+            export_selection_only: false,
+            container: ContainerFormat::Mp4,
+            video_encoder: "libx264".into(),
+            rate_control_mode: VideoRateControlMode::TargetBitrateKbps,
+            target_video_bitrate_kbps: 450,
+            two_pass: true,
+            pixel_format: VideoPixelFormat::Yuv420p10le,
+            encoder_preset: "ultrafast".into(),
+            ..ExportSettings::default()
+        };
+        assert!(settings_2p.supports_two_pass());
+        let h_2p = start_export_job(
+            bins.clone(),
+            project.clone(),
+            FilterPipeline::new(),
+            settings_2p,
+            two_pass_out.clone(),
+        )
+        .unwrap();
+        let mut ok_2p = false;
+        while let Ok(ev) = h_2p.receiver.recv() {
+            match ev {
+                ExportEvent::Completed { .. } => {
+                    ok_2p = true;
+                    break;
+                }
+                ExportEvent::Failed(e) => panic!("2-pass export failed: {e}"),
+                _ => {}
+            }
+        }
+        assert!(ok_2p);
+        let probed_2p = probe_media_file(&bins, &two_pass_out, true).unwrap();
+        assert_eq!(probed_2p.pixel_format, "yuv420p10le");
+
+        // 2. Animated GIF export
+        let gif_out = tmp.path().join("clip.gif");
+        let h_gif = start_animated_gif_or_webp_export_job(
+            bins.clone(),
+            project.clone(),
+            FilterPipeline::new(),
+            false,
+            10,
+            120,
+            true,
+            gif_out.clone(),
+        )
+        .unwrap();
+        let mut ok_gif = false;
+        while let Ok(ev) = h_gif.receiver.recv() {
+            match ev {
+                ExportEvent::Completed { .. } => {
+                    ok_gif = true;
+                    break;
+                }
+                ExportEvent::Failed(e) => panic!("GIF export failed: {e}"),
+                _ => {}
+            }
+        }
+        assert!(ok_gif);
+        assert!(std::fs::metadata(&gif_out).unwrap().len() > 200);
+
+        // 3. PNG Image Sequence export
+        let seq_dir = tmp.path().join("frames");
+        let h_seq = start_image_sequence_export_job(
+            bins,
+            project,
+            FilterPipeline::new(),
+            false,
+            "png".into(),
+            seq_dir.clone(),
+            "testframe".into(),
+        )
+        .unwrap();
+        let mut ok_seq = false;
+        while let Ok(ev) = h_seq.receiver.recv() {
+            match ev {
+                ExportEvent::Completed { .. } => {
+                    ok_seq = true;
+                    break;
+                }
+                ExportEvent::Failed(e) => panic!("Image sequence export failed: {e}"),
+                _ => {}
+            }
+        }
+        assert!(ok_seq);
+        assert!(seq_dir.join("testframe_00001.png").is_file());
     }
 }

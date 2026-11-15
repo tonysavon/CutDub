@@ -666,7 +666,7 @@ pub fn probe_packet_timing_map(
         "-select_streams",
         "v:0",
         "-show_entries",
-        "packet=pts_time,dts_time,duration_time,flags",
+        "packet=pts_time,dts_time,duration_time,size,flags",
         "-of",
         "csv=p=0",
     ])
@@ -689,7 +689,7 @@ pub fn probe_packet_timing_map(
         if line.is_empty() {
             continue;
         }
-        // CSV fields: pts_time,dts_time,duration_time,flags
+        // CSV fields: pts_time,dts_time,duration_time,size,flags
         let parts: Vec<&str> = line.split(',').collect();
         if parts.is_empty() {
             continue;
@@ -704,7 +704,11 @@ pub fn probe_packet_timing_map(
             .and_then(|s| s.parse::<f64>().ok())
             .map(|d| (d * 1_000_000.0).round() as i64)
             .unwrap_or(default_dur);
-        let flags = parts.get(3).copied().unwrap_or("");
+        let packet_size_bytes = parts
+            .get(3)
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .unwrap_or(0);
+        let flags = parts.get(4).copied().unwrap_or("");
         let is_keyframe = flags.contains('K');
 
         entries.push(FrameEntry {
@@ -712,6 +716,7 @@ pub fn probe_packet_timing_map(
             pts_us: TimestampUs::from_seconds_f64(time_secs.max(0.0)),
             duration_us: dur_us.max(1),
             is_keyframe,
+            packet_size_bytes,
         });
     }
 
@@ -836,11 +841,12 @@ pub fn export_frame_snapshot(
     Ok(())
 }
 
-/// Type of event detected by the Scene Change / Black-Frame analyzer.
+/// Type of event detected by the Scene Change / Black-Frame / Audio Silence analyzer.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SceneMarkerKind {
     SceneCut { score: f32 },
     BlackSegment { duration_secs: f32 },
+    AudioSilence { duration_secs: f32 },
 }
 
 /// A scene cut or black-frame interval detected by FFmpeg's `scdet` and `blackdetect` filters.
@@ -939,6 +945,92 @@ pub fn detect_scenes_and_black_frames(
                     kind: SceneMarkerKind::SceneCut { score },
                 });
             }
+        }
+    }
+
+    markers.sort_by_key(|m| m.timestamp.0);
+    Ok(markers)
+}
+
+fn parse_after_tag(line: &str, tag: &str) -> Option<f64> {
+    let idx = line.find(tag)?;
+    let rest = line[idx + tag.len()..].trim_start();
+    let tok = rest
+        .split(|c: char| c.is_whitespace() || c == '|')
+        .next()?;
+    tok.parse::<f64>().ok()
+}
+
+/// Scans an audio stream in `[start_pts, start_pts + duration_secs]` using FFmpeg's
+/// `silencedetect` filter to locate silent segments.
+pub fn detect_audio_silence(
+    binaries: &FfmpegBinaries,
+    path: &Path,
+    audio_stream_index: usize,
+    start_pts: TimestampUs,
+    duration_secs: f64,
+    noise_db: f32,
+    min_silence_secs: f32,
+) -> Result<Vec<DetectedSceneMarker>, MediaError> {
+    let start_secs = start_pts.as_seconds_f64();
+    let thresh_db = noise_db.clamp(-90.0, -5.0);
+    let min_d = min_silence_secs.clamp(0.1, 30.0);
+    let af = format!("silencedetect=noise={thresh_db:.1}dB:d={min_d:.2}");
+
+    let mut cmd = Command::new(&binaries.ffmpeg_path);
+    configure_background_command(&mut cmd);
+    cmd.args(["-hide_banner", "-nostdin"]);
+    if start_secs > 0.001 {
+        cmd.arg("-ss").arg(format!("{start_secs:.6}"));
+    }
+    cmd.arg("-i").arg(path);
+    cmd.arg("-t").arg(format!("{:.3}", duration_secs.max(0.5)));
+    cmd.args([
+        "-map",
+        &format!("0:{audio_stream_index}"),
+        "-af",
+        &af,
+        "-vn",
+        "-sn",
+        "-f",
+        "null",
+        "-",
+    ]);
+
+    let out = cmd.output()?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let mut markers = Vec::new();
+    let mut pending_start: Option<f64> = None;
+
+    for line in stderr.lines() {
+        if let Some(st) = parse_after_tag(line, "silence_start:") {
+            pending_start = Some(st);
+        } else if let Some(dur) = parse_after_tag(line, "silence_duration:") {
+            let st = pending_start
+                .take()
+                .or_else(|| parse_after_tag(line, "silence_end:").map(|end| (end - dur).max(0.0)));
+            if let Some(st) = st {
+                let abs_us = start_pts.0 + (st * 1_000_000.0).round() as i64;
+                markers.push(DetectedSceneMarker {
+                    timestamp: TimestampUs(abs_us.max(0)),
+                    kind: SceneMarkerKind::AudioSilence {
+                        duration_secs: dur.max(0.0) as f32,
+                    },
+                });
+            }
+        }
+    }
+
+    if let Some(st) = pending_start {
+        let trailing_dur = (duration_secs - st).max(0.0);
+        if trailing_dur >= (min_d as f64 * 0.5) {
+            let abs_us = start_pts.0 + (st * 1_000_000.0).round() as i64;
+            markers.push(DetectedSceneMarker {
+                timestamp: TimestampUs(abs_us.max(0)),
+                kind: SceneMarkerKind::AudioSilence {
+                    duration_secs: trailing_dur as f32,
+                },
+            });
         }
     }
 

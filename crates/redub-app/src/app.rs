@@ -11,11 +11,12 @@ use redub_core::{
     AudioExportMode, AudioWaveform, FrameTimingMap, Project, ResolvedFrame, TimestampUs,
 };
 use redub_export::{
-    execute_automation_script, is_lossless_or_pcm_audio_encoder, start_audio_only_export_job,
-    start_batch_queue, start_export_job, start_split_by_markers_export_job, AudioChannelMode,
-    AudioProcessingMode, AutomationScript, BatchEvent, BatchItemStatus, BatchJobHandle,
-    BatchJobItem, ContainerFormat, EncodingPreset, ExportEvent, ExportJobHandle, ExportSettings,
-    KeyframeCutPolicy, VideoProcessingMode, VideoRateControlMode,
+    execute_automation_script, is_lossless_or_pcm_audio_encoder,
+    start_animated_gif_or_webp_export_job, start_audio_only_export_job, start_batch_queue,
+    start_export_job, start_image_sequence_export_job, start_split_by_markers_export_job,
+    AudioChannelMode, AudioProcessingMode, AutomationScript, BatchEvent, BatchItemStatus,
+    BatchJobHandle, BatchJobItem, ContainerFormat, EncodingPreset, ExportEvent, ExportJobHandle,
+    ExportSettings, KeyframeCutPolicy, VideoPixelFormat, VideoProcessingMode, VideoRateControlMode,
 };
 use redub_filters::{
     compute_rgba_histogram, AspectRatioMode, ConvolutionPreset, DeinterlaceEngine,
@@ -23,9 +24,10 @@ use redub_filters::{
     OverlayPosition, ResizeSpecMode, RotationAngle, ScalingAlgorithm, SharpenMode,
 };
 use redub_media::{
-    detect_scenes_and_black_frames, export_frame_snapshot, extract_audio_waveform,
-    generate_synthetic_video, probe_local_keyframes, probe_media_file, probe_packet_timing_map,
-    DetectedSceneMarker, FfmpegProcessDecoder, MediaCapabilities, SceneMarkerKind,
+    detect_audio_silence, detect_scenes_and_black_frames, export_frame_snapshot,
+    extract_audio_waveform, generate_synthetic_video, probe_local_keyframes, probe_media_file,
+    probe_packet_timing_map, DetectedSceneMarker, FfmpegProcessDecoder, MediaCapabilities,
+    SceneMarkerKind,
 };
 use redub_platform::{AppPaths, AppSettings, FfmpegBinaries};
 use redub_preview::{AudioPreviewPlayer, NavigationHint, PlaybackClock, PreviewEngine};
@@ -135,22 +137,28 @@ pub struct CutDubApp {
     // Background audio waveform extractor channel: (source_id, AudioWaveform)
     waveform_rx: Option<Receiver<(usize, AudioWaveform)>>,
     show_waveform: bool,
+    show_bitrate_graph: bool,
 
     // Active export job
     export_job: Option<ExportJobHandle>,
     export_progress: Option<ActiveExportStatus>,
+    gif_fps: u32,
+    gif_max_width: u32,
+    gif_loop: bool,
 
     // Batch processing queue
     batch_items: Vec<BatchJobItem>,
     batch_output_dir: Option<PathBuf>,
     batch_job: Option<BatchJobHandle>,
 
-    // Scene change & black-frame detector
+    // Scene change, black-frame & audio silence detector
     scene_markers: Vec<DetectedSceneMarker>,
     scene_scan_rx: Option<Receiver<Vec<DetectedSceneMarker>>>,
     is_scanning_scenes: bool,
     scene_threshold: f32,
     min_black_duration: f32,
+    silence_noise_db: f32,
+    min_silence_duration: f32,
 
     // Timeline zoom (1.0..64.0) & horizontal pan center fraction (0.0..1.0)
     timeline_zoom: f32,
@@ -240,8 +248,12 @@ impl CutDubApp {
             probed_kf_window: None,
             waveform_rx: None,
             show_waveform: true,
+            show_bitrate_graph: true,
             export_job: None,
             export_progress: None,
+            gif_fps: 15,
+            gif_max_width: 640,
+            gif_loop: true,
             batch_items: Vec::new(),
             batch_output_dir: None,
             batch_job: None,
@@ -250,6 +262,8 @@ impl CutDubApp {
             is_scanning_scenes: false,
             scene_threshold: 12.0,
             min_black_duration: 0.20,
+            silence_noise_db: -35.0,
+            min_silence_duration: 0.50,
             timeline_zoom: 1.0,
             timeline_pan_center: 0.5,
             status_banner: None,
@@ -587,15 +601,31 @@ impl CutDubApp {
             }
         }
 
-        // 1b-2. Poll background scene & black-frame detector
+        // 1b-2. Poll background scene, black-frame & audio silence detector
         if let Some(rx) = &self.scene_scan_rx {
             if let Ok(markers) = rx.try_recv() {
                 let count = markers.len();
-                self.scene_markers = markers;
+                let is_silence_scan = markers
+                    .iter()
+                    .any(|m| matches!(m.kind, SceneMarkerKind::AudioSilence { .. }));
+                if count > 0 {
+                    if is_silence_scan {
+                        self.scene_markers
+                            .retain(|m| !matches!(m.kind, SceneMarkerKind::AudioSilence { .. }));
+                    } else {
+                        self.scene_markers
+                            .retain(|m| matches!(m.kind, SceneMarkerKind::AudioSilence { .. }));
+                    }
+                    self.scene_markers.extend(markers);
+                    self.scene_markers.sort_by_key(|m| m.timestamp.0);
+                }
                 self.is_scanning_scenes = false;
                 self.scene_scan_rx = None;
                 self.set_status(
-                    format!("Detected {count} scene cut / black-frame marker(s)."),
+                    format!(
+                        "Detected {count} new marker(s) ({} total marker(s) on timeline).",
+                        self.scene_markers.len()
+                    ),
                     false,
                 );
                 ctx.request_repaint();
@@ -1804,7 +1834,7 @@ impl CutDubApp {
             .unwrap_or((1920, 1080));
         let (_, out_w, out_h) = self.filters.to_ffmpeg_filtergraph(src_dims.0, src_dims.1);
 
-        // Extract active crop filter (if any) so the Source preview can render interactive crop handles
+        // Extract active crop & delogo filters (if any) so the Source preview can render interactive handles
         let mut active_crop: Option<(u32, u32, u32, u32)> = self
             .filters
             .filters
@@ -1821,6 +1851,23 @@ impl CutDubApp {
             });
         let had_crop = active_crop;
 
+        let mut active_delogo: Option<(u32, u32, u32, u32)> = self
+            .filters
+            .filters
+            .iter()
+            .find(|f| f.enabled && matches!(f.kind, FilterKind::Delogo { .. }))
+            .and_then(|f| match f.kind {
+                FilterKind::Delogo {
+                    x,
+                    y,
+                    width,
+                    height,
+                    ..
+                } => Some((x, y, width, height)),
+                _ => None,
+            });
+        let had_delogo = active_delogo;
+
         match self.preview_layout {
             PreviewLayoutMode::DualSideBySide => {
                 ui.columns(2, |cols| {
@@ -1833,6 +1880,7 @@ impl CutDubApp {
                         self.preview_zoom,
                         Color32::from_rgb(70, 145, 235),
                         &mut active_crop,
+                        &mut active_delogo,
                     );
                     let output_title = match self.export_settings.processing_mode {
                         VideoProcessingMode::DirectStreamCopy => "OUTPUT (DIRECT STREAM COPY)",
@@ -1848,6 +1896,7 @@ impl CutDubApp {
                         self.output_texture.as_ref().or(self.source_texture.as_ref())
                     };
                     let mut no_crop = None;
+                    let mut no_delogo = None;
                     Self::draw_single_preview_pane(
                         &mut cols[1],
                         output_title,
@@ -1857,6 +1906,7 @@ impl CutDubApp {
                         self.preview_zoom,
                         Color32::from_rgb(80, 200, 130),
                         &mut no_crop,
+                        &mut no_delogo,
                     );
                 });
             }
@@ -1870,10 +1920,12 @@ impl CutDubApp {
                     self.preview_zoom,
                     Color32::from_rgb(70, 145, 235),
                     &mut active_crop,
+                    &mut active_delogo,
                 );
             }
             PreviewLayoutMode::OutputOnly => {
                 let mut no_crop = None;
+                let mut no_delogo = None;
                 Self::draw_single_preview_pane(
                     ui,
                     "OUTPUT PREVIEW",
@@ -1883,6 +1935,7 @@ impl CutDubApp {
                     self.preview_zoom,
                     Color32::from_rgb(80, 200, 130),
                     &mut no_crop,
+                    &mut no_delogo,
                 );
             }
         }
@@ -1905,6 +1958,30 @@ impl CutDubApp {
                 }
             }
         }
+
+        // Write back any interactive DeLogo box changes made on the Source canvas
+        if active_delogo != had_delogo {
+            if let Some((nx, ny, nw, nh)) = active_delogo {
+                if let Some(inst) = self
+                    .filters
+                    .filters
+                    .iter_mut()
+                    .find(|f| f.enabled && matches!(f.kind, FilterKind::Delogo { .. }))
+                {
+                    let keep_border = match inst.kind {
+                        FilterKind::Delogo { show_border, .. } => show_border,
+                        _ => false,
+                    };
+                    inst.kind = FilterKind::Delogo {
+                        x: nx,
+                        y: ny,
+                        width: nw,
+                        height: nh,
+                        show_border: keep_border,
+                    };
+                }
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1917,6 +1994,7 @@ impl CutDubApp {
         zoom: PreviewZoom,
         badge_color: Color32,
         crop_overlay: &mut Option<(u32, u32, u32, u32)>,
+        delogo_overlay: &mut Option<(u32, u32, u32, u32)>,
     ) {
         let frame = egui::Frame::canvas(ui.style())
             .fill(Color32::from_rgb(16, 18, 22))
@@ -1931,6 +2009,13 @@ impl CutDubApp {
                         RichText::new("[Drag edges to crop]")
                             .size(10.5)
                             .color(Color32::from_rgb(245, 195, 75)),
+                    );
+                }
+                if delogo_overlay.is_some() {
+                    ui.label(
+                        RichText::new("[Drag cyan box for DeLogo]")
+                            .size(10.5)
+                            .color(Color32::from_rgb(65, 235, 230)),
                     );
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1950,7 +2035,7 @@ impl CutDubApp {
             });
 
             let canvas_size = ui.available_size();
-            let sense = if crop_overlay.is_some() {
+            let sense = if crop_overlay.is_some() || delogo_overlay.is_some() {
                 Sense::click_and_drag()
             } else {
                 Sense::hover()
@@ -1982,9 +2067,36 @@ impl CutDubApp {
                     StrokeKind::Outside,
                 );
 
+                // Resolve which interactive overlay owns the current drag gesture
+                let drag_id = egui::Id::new("cutdub_source_overlay_drag_target");
+                if resp.drag_started() {
+                    let mut pick_delogo = false;
+                    if let (Some((dx, dy, dw, dh)), Some(ptr)) =
+                        (*delogo_overlay, resp.interact_pointer_pos())
+                    {
+                        let d_rect = Rect::from_min_max(
+                            Pos2::new(
+                                img_rect.left() + (dx as f32 / w) * img_rect.width(),
+                                img_rect.top() + (dy as f32 / h) * img_rect.height(),
+                            ),
+                            Pos2::new(
+                                img_rect.left() + ((dx + dw) as f32 / w) * img_rect.width(),
+                                img_rect.top() + ((dy + dh) as f32 / h) * img_rect.height(),
+                            ),
+                        );
+                        if crop_overlay.is_none() || d_rect.expand(12.0).contains(ptr) {
+                            pick_delogo = true;
+                        }
+                    }
+                    ui.ctx().data_mut(|d| d.insert_temp(drag_id, pick_delogo));
+                }
+                let dragging_delogo = delogo_overlay.is_some()
+                    && (crop_overlay.is_none()
+                        || ui.ctx().data(|d| d.get_temp::<bool>(drag_id).unwrap_or(false)));
+
                 // Interactive On-Canvas Crop Overlay & Handles
                 if let Some((left, top, right, bottom)) = crop_overlay {
-                    if resp.dragged() {
+                    if resp.dragged() && !dragging_delogo {
                         if let Some(ptr) = resp.interact_pointer_pos() {
                             let rel_x = ((ptr.x - img_rect.left()) / img_rect.width().max(1.0))
                                 .clamp(0.0, 1.0);
@@ -2104,6 +2216,96 @@ impl CutDubApp {
                         );
                     }
                 }
+
+                // Interactive On-Canvas DeLogo Watermark Box & Handles (Cyan)
+                if let Some((dx, dy, dw, dh)) = delogo_overlay {
+                    if resp.dragged() && dragging_delogo && dimensions.0 >= 12 && dimensions.1 >= 12 {
+                        if let Some(ptr) = resp.interact_pointer_pos() {
+                            let rel_x = ((ptr.x - img_rect.left()) / img_rect.width().max(1.0))
+                                .clamp(0.0, 1.0);
+                            let rel_y = ((ptr.y - img_rect.top()) / img_rect.height().max(1.0))
+                                .clamp(0.0, 1.0);
+                            let px_x = (rel_x * w).round() as u32;
+                            let px_y = (rel_y * h).round() as u32;
+
+                            let cur_r = *dx + *dw;
+                            let cur_b = *dy + *dh;
+                            let dist_l = (px_x as i64 - *dx as i64).abs();
+                            let dist_r = (cur_r as i64 - px_x as i64).abs();
+                            let dist_t = (px_y as i64 - *dy as i64).abs();
+                            let dist_b = (cur_b as i64 - px_y as i64).abs();
+                            let min_edge = dist_l.min(dist_r).min(dist_t).min(dist_b);
+                            let edge_thresh =
+                                ((dimensions.0.max(dimensions.1) as f32) * 0.018).clamp(6.0, 24.0)
+                                    as i64;
+
+                            if min_edge <= edge_thresh {
+                                if min_edge == dist_l {
+                                    let new_x = px_x.clamp(1, cur_r.saturating_sub(8).max(1));
+                                    *dw = cur_r.saturating_sub(new_x).max(8);
+                                    *dx = new_x;
+                                } else if min_edge == dist_r {
+                                    let new_r = px_x.clamp(*dx + 8, dimensions.0 - 1);
+                                    *dw = new_r.saturating_sub(*dx).max(8);
+                                } else if min_edge == dist_t {
+                                    let new_y = px_y.clamp(1, cur_b.saturating_sub(8).max(1));
+                                    *dh = cur_b.saturating_sub(new_y).max(8);
+                                    *dy = new_y;
+                                } else {
+                                    let new_b = px_y.clamp(*dy + 8, dimensions.1 - 1);
+                                    *dh = new_b.saturating_sub(*dy).max(8);
+                                }
+                            } else {
+                                *dx = px_x
+                                    .saturating_sub(*dw / 2)
+                                    .clamp(1, dimensions.0.saturating_sub(*dw + 1).max(1));
+                                *dy = px_y
+                                    .saturating_sub(*dh / 2)
+                                    .clamp(1, dimensions.1.saturating_sub(*dh + 1).max(1));
+                            }
+                        }
+                    }
+
+                    let d_left = img_rect.left() + (*dx as f32 / w) * img_rect.width();
+                    let d_top = img_rect.top() + (*dy as f32 / h) * img_rect.height();
+                    let d_right = img_rect.left() + ((*dx + *dw) as f32 / w) * img_rect.width();
+                    let d_bot = img_rect.top() + ((*dy + *dh) as f32 / h) * img_rect.height();
+                    let delogo_rect = Rect::from_min_max(
+                        Pos2::new(d_left, d_top),
+                        Pos2::new(d_right.max(d_left + 6.0), d_bot.max(d_top + 6.0)),
+                    );
+                    let cyan = Color32::from_rgb(55, 235, 230);
+                    painter.rect_filled(
+                        delogo_rect,
+                        0.0,
+                        Color32::from_rgba_unmultiplied(55, 235, 230, 35),
+                    );
+                    painter.rect_stroke(
+                        delogo_rect,
+                        0.0,
+                        Stroke::new(2.0_f32, cyan),
+                        StrokeKind::Inside,
+                    );
+                    for pt in [
+                        delogo_rect.left_top(),
+                        delogo_rect.right_top(),
+                        delogo_rect.left_bottom(),
+                        delogo_rect.right_bottom(),
+                    ] {
+                        painter.rect_filled(
+                            Rect::from_center_size(pt, Vec2::splat(7.0)),
+                            1.0,
+                            cyan,
+                        );
+                    }
+                    painter.text(
+                        Pos2::new(delogo_rect.left() + 4.0, (delogo_rect.top() - 13.0).max(img_rect.top() + 2.0)),
+                        egui::Align2::LEFT_TOP,
+                        format!("DELOGO {}×{}", dw, dh),
+                        FontId::monospace(10.5),
+                        cyan,
+                    );
+                }
             } else {
                 painter.text(
                     rect.center(),
@@ -2220,6 +2422,40 @@ impl CutDubApp {
                 }
             }
 
+            // Render per-frame Video Bitrate / Packet-Size spike bars along the lower timeline
+            if self.show_bitrate_graph {
+                let cols = (rect.width() as usize / 3).clamp(32, 420);
+                let br_samples = self
+                    .project
+                    .sample_timeline_bitrate_range(vis_start, vis_end, cols);
+                if !br_samples.is_empty() {
+                    let max_kbps = br_samples
+                        .iter()
+                        .map(|s| s.kbps)
+                        .fold(100.0_f32, f32::max);
+                    let max_bar_h = (rect.height() * 0.62).max(6.0);
+                    let base_y = rect.bottom() - 2.0;
+                    for (col_idx, sample) in br_samples.iter().enumerate() {
+                        if sample.kbps <= 0.0 {
+                            continue;
+                        }
+                        let x = rect.left()
+                            + (col_idx as f32 / (cols.saturating_sub(1).max(1) as f32))
+                                * rect.width();
+                        let bar_h = (sample.kbps / max_kbps).clamp(0.03, 1.0) * max_bar_h;
+                        let col = if sample.has_keyframe {
+                            Color32::from_rgba_unmultiplied(245, 180, 55, 135)
+                        } else {
+                            Color32::from_rgba_unmultiplied(85, 165, 245, 95)
+                        };
+                        painter.line_segment(
+                            [Pos2::new(x, base_y), Pos2::new(x, base_y - bar_h)],
+                            Stroke::new(2.0_f32, col),
+                        );
+                    }
+                }
+            }
+
             // Highlight Selection Range [sel_start, sel_end)
             if let Some((sel_start, sel_end)) = self.project.selection_range() {
                 if sel_end > vis_start && sel_start < vis_end {
@@ -2300,6 +2536,7 @@ impl CutDubApp {
                     let color = match marker.kind {
                         SceneMarkerKind::SceneCut { .. } => Color32::from_rgb(235, 95, 225),
                         SceneMarkerKind::BlackSegment { .. } => Color32::from_rgb(75, 215, 235),
+                        SceneMarkerKind::AudioSilence { .. } => Color32::from_rgb(250, 175, 60),
                     };
                     painter.line_segment(
                         [Pos2::new(x, rect.top() + 2.0), Pos2::new(x, rect.top() + 13.0)],
@@ -2581,6 +2818,7 @@ impl CutDubApp {
             ui.separator();
             ui.checkbox(&mut self.playback.loop_selection, "Loop Sel");
             ui.checkbox(&mut self.show_waveform, "Waveform");
+            ui.checkbox(&mut self.show_bitrate_graph, "Bitrate");
 
             ui.separator();
             let mute_label = if self.audio_player.muted {
@@ -2821,6 +3059,26 @@ impl CutDubApp {
                     primary.timing.keyframe_count()
                 ));
                 ui.end_row();
+
+                if let Some(gop) = self.project.gop_and_bitrate_stats() {
+                    ui.label("GOP Structure:");
+                    ui.label(format!(
+                        "Avg {:.1} f (min {}, max {})  |  {} keyframe(s)",
+                        gop.avg_gop_frames, gop.min_gop_frames, gop.max_gop_frames, gop.keyframe_count
+                    ));
+                    ui.end_row();
+
+                    if gop.known_packet_frames > 0 {
+                        ui.label("Stream Bitrate:");
+                        ui.label(format!(
+                            "Avg {:.0} kbps  |  Peak {:.0} kbps (max pkt {:.1} KB)",
+                            gop.avg_kbps,
+                            gop.peak_kbps,
+                            gop.peak_packet_bytes as f32 / 1024.0
+                        ));
+                        ui.end_row();
+                    }
+                }
             });
 
         ui.add_space(12.0);
@@ -3090,6 +3348,60 @@ impl CutDubApp {
                     self.filters.add(FilterKind::SubtitleBurnIn {
                         subtitle_path: String::new(),
                         font_size: 24,
+                    });
+                    self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
+                    ui.close_menu();
+                }
+                ui.separator();
+                ui.label(RichText::new("Watermark, Color Grade & Stabilizer").size(11.0).weak());
+                if ui
+                    .button("DeLogo / Watermark Remover (Interactive Box)")
+                    .clicked()
+                {
+                    let (sw, sh) = self
+                        .project
+                        .primary_source()
+                        .map(|s| (s.width, s.height))
+                        .unwrap_or((1280, 720));
+                    let bw = (sw / 6).clamp(32, 320);
+                    let bh = (sh / 10).clamp(24, 160);
+                    let bx = (sw / 16).max(8);
+                    let by = (sh / 16).max(8);
+                    self.filters.add(FilterKind::Delogo {
+                        x: bx,
+                        y: by,
+                        width: bw,
+                        height: bh,
+                        show_border: false,
+                    });
+                    self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
+                    ui.close_menu();
+                }
+                if ui.button("Logo / Image Watermark (.png / .jpg)").clicked() {
+                    self.filters.add(FilterKind::LogoOverlay {
+                        image_path: String::new(),
+                        x: 24,
+                        y: 24,
+                        scale_pct: 100.0,
+                        opacity: 0.85,
+                        position: OverlayPosition::BottomRight,
+                    });
+                    self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
+                    ui.close_menu();
+                }
+                if ui.button("3D LUT Color Grade (.cube)").clicked() {
+                    self.filters.add(FilterKind::Lut3d {
+                        lut_path: String::new(),
+                    });
+                    self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
+                    ui.close_menu();
+                }
+                if ui.button("Stabilize Video (Deshake)").clicked() {
+                    self.filters.add(FilterKind::Deshake {
+                        rx: 16,
+                        ry: 16,
+                        edge_mirror: true,
+                        blocksize: 8,
                     });
                     self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
                     ui.close_menu();
@@ -3893,6 +4205,111 @@ impl CutDubApp {
                         ui.text_edit_singleline(subtitle_path);
                         ui.add(egui::Slider::new(font_size, 12..=56).suffix(" pt").text("Font Size"));
                     }
+                    FilterKind::Delogo {
+                        x,
+                        y,
+                        width,
+                        height,
+                        show_border,
+                    } => {
+                        ui.label(
+                            RichText::new("Drag the cyan box directly on the Source Preview (edges resize, center moves).")
+                                .size(11.0)
+                                .color(Color32::from_rgb(80, 225, 220)),
+                        );
+                        ui.horizontal(|ui| {
+                            ui.label("X:");
+                            ui.add(egui::DragValue::new(x).range(1..=src_w.saturating_sub(4).max(1)));
+                            ui.label("Y:");
+                            ui.add(egui::DragValue::new(y).range(1..=src_h.saturating_sub(4).max(1)));
+                            ui.label("W:");
+                            ui.add(egui::DragValue::new(width).range(4..=src_w.max(4)));
+                            ui.label("H:");
+                            ui.add(egui::DragValue::new(height).range(4..=src_h.max(4)));
+                        });
+                        ui.checkbox(show_border, "Show diagnostic green border during FFmpeg export");
+                    }
+                    FilterKind::LogoOverlay {
+                        image_path,
+                        x,
+                        y,
+                        scale_pct,
+                        opacity,
+                        position,
+                    } => {
+                        ui.horizontal(|ui| {
+                            if ui.button("📂 Choose Logo Image (.png / .jpg / .webp)...").clicked() {
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("Images", &["png", "jpg", "jpeg", "webp"])
+                                    .pick_file()
+                                {
+                                    *image_path = path.display().to_string();
+                                }
+                            }
+                            if !image_path.is_empty() && ui.small_button("Clear").clicked() {
+                                image_path.clear();
+                            }
+                        });
+                        ui.text_edit_singleline(image_path);
+                        egui::ComboBox::from_id_salt(format!("logo_pos_{}", instance.id))
+                            .selected_text(format!("Anchor: {}", position.label()))
+                            .show_ui(ui, |ui| {
+                                for pos in OverlayPosition::ALL {
+                                    ui.selectable_value(position, pos, pos.label());
+                                }
+                            });
+                        ui.horizontal(|ui| {
+                            ui.label("Margin X:");
+                            ui.add(egui::DragValue::new(x).range(-1000..=1000).suffix(" px"));
+                            ui.label("Y:");
+                            ui.add(egui::DragValue::new(y).range(-1000..=1000).suffix(" px"));
+                        });
+                        ui.add(
+                            egui::Slider::new(scale_pct, 10.0..=300.0)
+                                .suffix("%")
+                                .text("Scale"),
+                        );
+                        ui.add(egui::Slider::new(opacity, 0.05..=1.0).text("Opacity"));
+                    }
+                    FilterKind::Lut3d { lut_path } => {
+                        ui.horizontal(|ui| {
+                            if ui.button("📂 Choose 3D LUT (.cube / .3dl)...").clicked() {
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("3D LUT", &["cube", "3dl"])
+                                    .pick_file()
+                                {
+                                    *lut_path = path.display().to_string();
+                                }
+                            }
+                            if !lut_path.is_empty() && ui.small_button("Clear").clicked() {
+                                lut_path.clear();
+                            }
+                        });
+                        ui.text_edit_singleline(lut_path);
+                    }
+                    FilterKind::Deshake {
+                        rx,
+                        ry,
+                        edge_mirror,
+                        blocksize,
+                    } => {
+                        ui.add(
+                            egui::Slider::new(rx, 4..=64)
+                                .suffix(" px")
+                                .text("Max Horizontal Shift"),
+                        );
+                        ui.add(
+                            egui::Slider::new(ry, 4..=64)
+                                .suffix(" px")
+                                .text("Max Vertical Shift"),
+                        );
+                        ui.add(
+                            egui::Slider::new(blocksize, 4..=64)
+                                .suffix(" px")
+                                .text("Motion Block Size"),
+                        );
+                        ui.checkbox(edge_mirror, "Mirror borders to hide stabilization edges");
+                    }
                 }
             }
         });
@@ -4385,6 +4802,29 @@ impl CutDubApp {
                             });
                     }
 
+                    ui.add_space(4.0);
+                    egui::ComboBox::from_id_salt("pix_fmt_combo")
+                        .selected_text(format!(
+                            "Pixel Format: {}",
+                            self.export_settings.pixel_format.ffmpeg_name()
+                        ))
+                        .show_ui(ui, |ui| {
+                            for pf in VideoPixelFormat::ALL {
+                                ui.selectable_value(
+                                    &mut self.export_settings.pixel_format,
+                                    pf,
+                                    pf.label(),
+                                );
+                            }
+                        });
+
+                    if self.export_settings.supports_two_pass() {
+                        ui.checkbox(
+                            &mut self.export_settings.two_pass,
+                            "🎯 True 2-Pass Encoding (Pass 1 stats analysis + Pass 2 bitrate allocation)",
+                        );
+                    }
+
                     ui.checkbox(
                         &mut self.export_settings.use_hwaccel_decode,
                         "Use hardware acceleration for decoding (-hwaccel auto)",
@@ -4445,6 +4885,114 @@ impl CutDubApp {
         {
             self.trigger_export_dialog();
         }
+
+        ui.add_space(10.0);
+        ui.group(|ui| {
+            ui.label(RichText::new("Animated GIF / WebP & Image Sequence Export").strong());
+            ui.add(
+                egui::Slider::new(&mut self.gif_fps, 5..=30)
+                    .suffix(" fps")
+                    .text("GIF/WebP Frame Rate"),
+            );
+            ui.add(
+                egui::Slider::new(&mut self.gif_max_width, 160..=1920)
+                    .suffix(" px")
+                    .text("Max Width"),
+            );
+            ui.checkbox(&mut self.gif_loop, "Loop infinitely");
+
+            let can_special_export = self.project.is_loaded() && self.export_job.is_none();
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add_enabled(
+                        can_special_export,
+                        egui::Button::new("🎞 Export Animated GIF / WebP..."),
+                    )
+                    .clicked()
+                {
+                    if let Some(bins) = self.binaries.clone() {
+                        let stem = self
+                            .project
+                            .primary_source()
+                            .and_then(|s| s.path.file_stem())
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("clip");
+                        if let Some(out_path) = rfd::FileDialog::new()
+                            .set_file_name(format!("{stem}.gif"))
+                            .add_filter("Animated Image", &["gif", "webp"])
+                            .save_file()
+                        {
+                            match start_animated_gif_or_webp_export_job(
+                                bins,
+                                self.project.clone(),
+                                self.filters.clone(),
+                                self.export_settings.export_selection_only,
+                                self.gif_fps,
+                                self.gif_max_width,
+                                self.gif_loop,
+                                out_path,
+                            ) {
+                                Ok(handle) => {
+                                    self.export_job = Some(handle);
+                                    self.set_status("Exporting animated GIF / WebP...", false);
+                                }
+                                Err(e) => {
+                                    self.set_status(format!("GIF/WebP export failed: {e}"), true);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                for (btn_lbl, ext) in [
+                    ("🖼 Export PNG Sequence...", "png"),
+                    ("🖼 Export JPEG Sequence...", "jpg"),
+                ] {
+                    if ui
+                        .add_enabled(can_special_export, egui::Button::new(btn_lbl))
+                        .clicked()
+                    {
+                        if let Some(bins) = self.binaries.clone() {
+                            let prefix = self
+                                .project
+                                .primary_source()
+                                .and_then(|s| s.path.file_stem())
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("frame")
+                                .to_string();
+                            if let Some(dir_path) = rfd::FileDialog::new().pick_folder() {
+                                match start_image_sequence_export_job(
+                                    bins,
+                                    self.project.clone(),
+                                    self.filters.clone(),
+                                    self.export_settings.export_selection_only,
+                                    ext.to_string(),
+                                    dir_path,
+                                    prefix,
+                                ) {
+                                    Ok(handle) => {
+                                        self.export_job = Some(handle);
+                                        self.set_status(
+                                            format!(
+                                                "Exporting {} image sequence...",
+                                                ext.to_ascii_uppercase()
+                                            ),
+                                            false,
+                                        );
+                                    }
+                                    Err(e) => {
+                                        self.set_status(
+                                            format!("Image sequence export failed: {e}"),
+                                            true,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        });
     }
 
     fn render_audio_encoding_section(&mut self, ui: &mut Ui, id_prefix: &str) {
@@ -5338,10 +5886,149 @@ impl CutDubApp {
             }
         });
 
+        ui.add_space(6.0);
+        ui.separator();
+        ui.heading("Audio Silence Detector & Auto-Ripple Cut");
+        ui.add(
+            egui::Slider::new(&mut self.silence_noise_db, -60.0..=-15.0)
+                .suffix(" dB")
+                .text("Silence Floor"),
+        );
+        ui.add(
+            egui::Slider::new(&mut self.min_silence_duration, 0.15..=5.0)
+                .suffix(" s")
+                .text("Min Silence Duration"),
+        );
+        ui.horizontal_wrapped(|ui| {
+            let can_scan_audio = self.project.is_loaded()
+                && !self.is_scanning_scenes
+                && self
+                    .project
+                    .primary_source()
+                    .map(|c| !c.audio_streams.is_empty())
+                    .unwrap_or(false);
+            if ui
+                .add_enabled(can_scan_audio, egui::Button::new("🔇 Scan Audio Silence"))
+                .on_hover_text("Scan the active selection (or up to 300s / 60s window) for silent passages")
+                .clicked()
+            {
+                if let (Some(bins), Some(clip)) = (
+                    self.binaries.clone(),
+                    self.project.primary_source().cloned(),
+                ) {
+                    if let Some(a_stream) = clip.audio_streams.first() {
+                        let audio_idx = a_stream.stream_index;
+                        let (start_pts, dur_secs) =
+                            if let Some((s, e)) = self.project.selection_range() {
+                                let sp = self
+                                    .project
+                                    .resolve_frame(s)
+                                    .map(|r| r.source_pts)
+                                    .unwrap_or(TimestampUs::ZERO);
+                                let ep = self
+                                    .project
+                                    .resolve_frame(e.saturating_sub(1))
+                                    .map(|r| r.source_pts)
+                                    .unwrap_or(TimestampUs(sp.0 + 60_000_000));
+                                (sp, ((ep.0 - sp.0).max(1_000_000) as f64) / 1_000_000.0)
+                            } else {
+                                let total_s = self.project.total_duration().as_seconds_f64();
+                                if total_s <= 300.0 {
+                                    (TimestampUs::ZERO, total_s.max(0.5))
+                                } else {
+                                    let cur = self
+                                        .project
+                                        .resolve_frame(self.project.current_frame)
+                                        .map(|r| r.source_pts)
+                                        .unwrap_or(TimestampUs::ZERO);
+                                    (cur, 60.0)
+                                }
+                            };
+                        let noise_db = self.silence_noise_db;
+                        let min_sil = self.min_silence_duration;
+                        let (tx, rx) = mpsc::channel();
+                        self.scene_scan_rx = Some(rx);
+                        self.is_scanning_scenes = true;
+                        self.set_status("Scanning audio stream for silent passages...", false);
+                        thread::Builder::new()
+                            .name("cutdub-silence-detector".into())
+                            .spawn(move || {
+                                if let Ok(markers) = detect_audio_silence(
+                                    &bins,
+                                    &clip.path,
+                                    audio_idx,
+                                    start_pts,
+                                    dur_secs,
+                                    noise_db,
+                                    min_sil,
+                                ) {
+                                    let _ = tx.send(markers);
+                                } else {
+                                    let _ = tx.send(Vec::new());
+                                }
+                            })
+                            .ok();
+                    }
+                }
+            }
+
+            let cuttable_count = self
+                .scene_markers
+                .iter()
+                .filter(|m| {
+                    matches!(
+                        m.kind,
+                        SceneMarkerKind::BlackSegment { .. } | SceneMarkerKind::AudioSilence { .. }
+                    )
+                })
+                .count();
+            if ui
+                .add_enabled(
+                    self.project.is_loaded() && cuttable_count > 0,
+                    egui::Button::new(format!(
+                        "✂ Auto-Cut {cuttable_count} Black/Silent Segment(s) (Undoable)"
+                    )),
+                )
+                .on_hover_text("Ripple-delete all detected Black Segments and Audio Silences (Cmd/Ctrl+Z to undo)")
+                .clicked()
+            {
+                let ranges: Vec<(TimestampUs, TimestampUs)> = self
+                    .scene_markers
+                    .iter()
+                    .filter_map(|m| match m.kind {
+                        SceneMarkerKind::BlackSegment { duration_secs }
+                        | SceneMarkerKind::AudioSilence { duration_secs } => {
+                            let end_us =
+                                m.timestamp.0 + (duration_secs as f64 * 1_000_000.0).round() as i64;
+                            Some((m.timestamp, TimestampUs(end_us)))
+                        }
+                        SceneMarkerKind::SceneCut { .. } => None,
+                    })
+                    .collect();
+                match self.project.remove_virtual_time_ranges(&ranges) {
+                    Ok(removed_frames) => {
+                        self.scene_markers.clear();
+                        self.playback.pause();
+                        self.displayed_frame_key = None;
+                        self.set_status(
+                            format!(
+                                "Ripple-cut {removed_frames} frames across {} black/silent segment(s) (Cmd/Ctrl+Z to Undo).",
+                                ranges.len()
+                            ),
+                            false,
+                        );
+                    }
+                    Err(e) => {
+                        self.set_status(format!("Auto-cut failed: {e}"), true);
+                    }
+                }
+            }
+        });
+
         if self.is_scanning_scenes {
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.label("Analyzing video stream for scene changes & black frames...");
+                ui.label("Analyzing media stream for scene cuts, black frames & silences...");
             });
         } else if !self.scene_markers.is_empty() {
             ui.add_space(4.0);
@@ -5379,6 +6066,17 @@ impl CutDubApp {
                                         duration_secs
                                     ))
                                     .color(Color32::from_rgb(100, 220, 240))
+                                    .strong(),
+                                );
+                            }
+                            SceneMarkerKind::AudioSilence { duration_secs } => {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "🔇 #{} Audio Silence ({:.2}s)",
+                                        m_idx + 1,
+                                        duration_secs
+                                    ))
+                                    .color(Color32::from_rgb(250, 185, 75))
                                     .strong(),
                                 );
                             }

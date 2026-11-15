@@ -177,6 +177,8 @@ pub struct FrameEntry {
     pub pts_us: TimestampUs,
     pub duration_us: i64,
     pub is_keyframe: bool,
+    #[serde(default)]
+    pub packet_size_bytes: u32,
 }
 
 /// Maps frame indices to exact presentation timestamps (PTS) and keyframe flags.
@@ -260,6 +262,7 @@ impl FrameTimingMap {
                 pts_us: TimestampUs(pts_us),
                 duration_us: dur_us,
                 is_keyframe: i % kf_step == 0,
+                packet_size_bytes: 0,
             });
         }
         Self {
@@ -486,6 +489,31 @@ impl AudioWaveform {
             .min(self.peaks.len() - 1);
         self.peaks[idx]
     }
+}
+
+/// Aggregated packet-size / frame-bitrate sample for a horizontal timeline bucket.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct BitrateSample {
+    /// Average instantaneous frame bitrate in kbps across sampled frames in the bucket.
+    pub kbps: f32,
+    /// Peak video packet size in bytes within this bucket.
+    pub max_packet_bytes: u32,
+    /// Whether this bucket contains at least one keyframe (IDR / I-frame).
+    pub has_keyframe: bool,
+}
+
+/// Summary GOP length and packet bitrate statistics across the active timeline.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GopBitrateStats {
+    pub known_packet_frames: u64,
+    pub keyframe_count: u64,
+    pub avg_gop_frames: f32,
+    pub min_gop_frames: u64,
+    pub max_gop_frames: u64,
+    pub avg_kbps: f32,
+    pub peak_kbps: f32,
+    pub avg_packet_bytes: u32,
+    pub peak_packet_bytes: u32,
 }
 
 /// A loaded video file in the project.
@@ -779,6 +807,295 @@ impl Project {
         out
     }
 
+    /// Resamples video packet sizes and instantaneous bitrates over `[start_frame, end_frame)`.
+    /// Returns an empty vector if no source has probed packet-size data yet.
+    pub fn sample_timeline_bitrate_range(
+        &self,
+        start_frame: u64,
+        end_frame: u64,
+        columns: usize,
+    ) -> Vec<BitrateSample> {
+        let total_frames = self.total_frames();
+        if columns == 0 || total_frames == 0 || start_frame >= end_frame {
+            return Vec::new();
+        }
+        let has_packet_sizes = self
+            .sources
+            .iter()
+            .any(|s| s.timing.entries.iter().any(|e| e.packet_size_bytes > 0));
+        if !has_packet_sizes {
+            return Vec::new();
+        }
+
+        let lo = start_frame.min(total_frames - 1);
+        let hi = end_frame.min(total_frames).max(lo + 1);
+        let span = hi - lo;
+
+        let mut out = Vec::with_capacity(columns);
+        for col in 0..columns {
+            let b_start = (lo + (col as u64 * span) / columns as u64).min(hi - 1);
+            let b_end = (lo + ((col as u64 + 1) * span) / columns as u64)
+                .max(b_start + 1)
+                .min(hi);
+            let bucket_len = b_end - b_start;
+            let step = (bucket_len / 6).max(1);
+
+            let mut kbps_sum = 0.0f64;
+            let mut count = 0u64;
+            let mut max_packet_bytes = 0u32;
+            let mut has_keyframe = false;
+
+            let mut f = b_start;
+            while f < b_end {
+                if let Some(resolved) = self.resolve_frame(f) {
+                    if let Some(src) = self.source_by_id(resolved.source_id) {
+                        if let Some(entry) = src.timing.frame_entry(resolved.source_frame) {
+                            has_keyframe |= entry.is_keyframe;
+                            if entry.packet_size_bytes > 0 {
+                                let dur_us = entry.duration_us.max(1) as f64;
+                                let kbps = (entry.packet_size_bytes as f64 * 8_000.0) / dur_us;
+                                kbps_sum += kbps;
+                                max_packet_bytes = max_packet_bytes.max(entry.packet_size_bytes);
+                                count += 1;
+                            }
+                        }
+                    }
+                }
+                f = f.saturating_add(step);
+            }
+
+            out.push(BitrateSample {
+                kbps: if count > 0 {
+                    (kbps_sum / count as f64) as f32
+                } else {
+                    0.0
+                },
+                max_packet_bytes,
+                has_keyframe,
+            });
+        }
+        out
+    }
+
+    /// Computes GOP interval and packet-bitrate statistics across the active timeline segments.
+    pub fn gop_and_bitrate_stats(&self) -> Option<GopBitrateStats> {
+        let total_frames = self.total_frames();
+        if total_frames == 0 {
+            return None;
+        }
+
+        let mut stats = GopBitrateStats::default();
+        let mut prev_kf_v_idx: Option<u64> = None;
+        let mut gop_sum = 0u64;
+        let mut gop_intervals = 0u64;
+        let mut min_gop = u64::MAX;
+        let mut max_gop = 0u64;
+
+        let mut kbps_sum = 0.0f64;
+        let mut bytes_sum = 0u64;
+        let mut v_idx = 0u64;
+
+        for seg in &self.segments {
+            let Some(src) = self.source_by_id(seg.source_id) else {
+                v_idx += seg.frame_count();
+                continue;
+            };
+            for sf in seg.start_frame..seg.end_frame {
+                if let Some(entry) = src.timing.frame_entry(sf) {
+                    if entry.is_keyframe {
+                        stats.keyframe_count += 1;
+                        if let Some(prev) = prev_kf_v_idx {
+                            let dist = v_idx.saturating_sub(prev);
+                            if dist > 0 {
+                                gop_sum += dist;
+                                gop_intervals += 1;
+                                min_gop = min_gop.min(dist);
+                                max_gop = max_gop.max(dist);
+                            }
+                        }
+                        prev_kf_v_idx = Some(v_idx);
+                    }
+                    if entry.packet_size_bytes > 0 {
+                        let dur_us = entry.duration_us.max(1) as f64;
+                        let kbps = (entry.packet_size_bytes as f64 * 8_000.0) / dur_us;
+                        stats.known_packet_frames += 1;
+                        kbps_sum += kbps;
+                        stats.peak_kbps = stats.peak_kbps.max(kbps as f32);
+                        bytes_sum += entry.packet_size_bytes as u64;
+                        stats.peak_packet_bytes =
+                            stats.peak_packet_bytes.max(entry.packet_size_bytes);
+                    }
+                }
+                v_idx += 1;
+            }
+        }
+
+        if stats.keyframe_count == 0 && stats.known_packet_frames == 0 {
+            return None;
+        }
+
+        if gop_intervals > 0 {
+            stats.avg_gop_frames = gop_sum as f32 / gop_intervals as f32;
+            stats.min_gop_frames = min_gop;
+            stats.max_gop_frames = max_gop;
+        } else if stats.keyframe_count == 1 {
+            stats.avg_gop_frames = total_frames as f32;
+            stats.min_gop_frames = total_frames;
+            stats.max_gop_frames = total_frames;
+        }
+
+        if stats.known_packet_frames > 0 {
+            stats.avg_kbps = (kbps_sum / stats.known_packet_frames as f64) as f32;
+            stats.avg_packet_bytes = (bytes_sum / stats.known_packet_frames) as u32;
+        }
+
+        Some(stats)
+    }
+
+    /// Ripple-deletes all non-overlapping virtual timestamp intervals `[start, end)` with full Undo support.
+    /// Returns the number of virtual frames removed.
+    pub fn remove_virtual_time_ranges(
+        &mut self,
+        ranges: &[(TimestampUs, TimestampUs)],
+    ) -> Result<u64, String> {
+        let total_frames = self.total_frames();
+        if total_frames == 0 || ranges.is_empty() {
+            return Ok(0);
+        }
+        let total_dur = self.total_duration();
+
+        let mut frame_ranges: Vec<(u64, u64)> = Vec::new();
+        for &(start_ts, end_ts) in ranges {
+            if end_ts.0 <= start_ts.0 {
+                continue;
+            }
+            let sf = self.virtual_timestamp_to_frame(start_ts).min(total_frames);
+            let mut ef = if end_ts.0 >= total_dur.0 {
+                total_frames
+            } else {
+                self.virtual_timestamp_to_frame(end_ts).min(total_frames)
+            };
+            if ef <= sf && sf < total_frames {
+                ef = (sf + 1).min(total_frames);
+            }
+            if sf < ef {
+                frame_ranges.push((sf, ef));
+            }
+        }
+
+        if frame_ranges.is_empty() {
+            return Ok(0);
+        }
+
+        frame_ranges.sort_by_key(|r| r.0);
+        let mut merged_removals: Vec<(u64, u64)> = Vec::with_capacity(frame_ranges.len());
+        for (sf, ef) in frame_ranges {
+            if let Some(last) = merged_removals.last_mut() {
+                if sf <= last.1 {
+                    last.1 = last.1.max(ef);
+                    continue;
+                }
+            }
+            merged_removals.push((sf, ef));
+        }
+
+        let mut keep_ranges: Vec<(u64, u64)> = Vec::new();
+        let mut cursor = 0u64;
+        for &(rs, re) in &merged_removals {
+            if cursor < rs {
+                keep_ranges.push((cursor, rs));
+            }
+            cursor = cursor.max(re);
+        }
+        if cursor < total_frames {
+            keep_ranges.push((cursor, total_frames));
+        }
+
+        if keep_ranges.is_empty() {
+            return Err(
+                "Removing all detected ranges would delete the entire timeline".to_string(),
+            );
+        }
+
+        let removed_frames: u64 = merged_removals.iter().map(|(s, e)| e - s).sum();
+        if removed_frames == 0 {
+            return Ok(0);
+        }
+
+        self.undo_stack.push(UndoEntry {
+            description: format!(
+                "Auto-cut {} detected range(s) ({} frames)",
+                merged_removals.len(),
+                removed_frames
+            ),
+            snapshot: TimelineSnapshot {
+                segments: self.segments.clone(),
+                selection_start: self.selection_start,
+                selection_end: self.selection_end,
+                current_frame: self.current_frame,
+            },
+        });
+        self.redo_stack.clear();
+
+        let mut new_segments: Vec<EditSegment> = Vec::new();
+        let mut seg_vf_start = 0u64;
+        let mut keep_idx = 0usize;
+        for seg in &self.segments {
+            let seg_len = seg.frame_count();
+            let seg_vf_end = seg_vf_start + seg_len;
+            while keep_idx < keep_ranges.len() && keep_ranges[keep_idx].1 <= seg_vf_start {
+                keep_idx += 1;
+            }
+            let mut k = keep_idx;
+            while k < keep_ranges.len() && keep_ranges[k].0 < seg_vf_end {
+                let (ks, ke) = keep_ranges[k];
+                let ov_start = seg_vf_start.max(ks);
+                let ov_end = seg_vf_end.min(ke);
+                if ov_start < ov_end {
+                    new_segments.push(EditSegment {
+                        source_id: seg.source_id,
+                        start_frame: seg.start_frame + (ov_start - seg_vf_start),
+                        end_frame: seg.start_frame + (ov_end - seg_vf_start),
+                    });
+                }
+                if ke <= seg_vf_end {
+                    k += 1;
+                    keep_idx = k;
+                } else {
+                    break;
+                }
+            }
+            seg_vf_start = seg_vf_end;
+        }
+
+        self.segments = merge_adjacent_segments(new_segments);
+        self.selection_start = None;
+        self.selection_end = None;
+
+        // Shift or drop user markers cleanly across removed frame ranges.
+        let mut updated_markers = Vec::with_capacity(self.markers.len());
+        let new_max = self.total_frames().saturating_sub(1);
+        for mut m in std::mem::take(&mut self.markers) {
+            let inside_removed = merged_removals
+                .iter()
+                .any(|&(rs, re)| m.frame >= rs && m.frame < re);
+            if inside_removed {
+                continue;
+            }
+            let removed_before: u64 = merged_removals
+                .iter()
+                .filter(|&&(_, re)| re <= m.frame)
+                .map(|&(rs, re)| re - rs)
+                .sum();
+            m.frame = m.frame.saturating_sub(removed_before).min(new_max);
+            updated_markers.push(m);
+        }
+        self.markers = updated_markers;
+        self.current_frame = self.current_frame.min(new_max);
+
+        Ok(removed_frames)
+    }
+
     /// Total number of frames in the active virtual timeline.
     pub fn total_frames(&self) -> u64 {
         self.segments.iter().map(|s| s.frame_count()).sum()
@@ -819,6 +1136,7 @@ impl Project {
                     pts_us: src.timing.frame_to_timestamp(source_frame),
                     duration_us: src.timing.nominal_fps.frame_duration_us(),
                     is_keyframe: source_frame == 0,
+                    packet_size_bytes: 0,
                 });
                 let within_seg_us = (entry.pts_us.0 - seg_start_pts.0).max(0);
                 return Some(ResolvedFrame {
@@ -1511,24 +1829,28 @@ mod tests {
                 pts_us: TimestampUs(0),
                 duration_us: 33_000,
                 is_keyframe: true,
+                packet_size_bytes: 0,
             },
             FrameEntry {
                 frame_number: 1,
                 pts_us: TimestampUs(33_000),
                 duration_us: 67_000,
                 is_keyframe: false,
+                packet_size_bytes: 0,
             },
             FrameEntry {
                 frame_number: 2,
                 pts_us: TimestampUs(100_000),
                 duration_us: 16_000,
                 is_keyframe: true,
+                packet_size_bytes: 0,
             },
             FrameEntry {
                 frame_number: 3,
                 pts_us: TimestampUs(116_000),
                 duration_us: 33_000,
                 is_keyframe: false,
+                packet_size_bytes: 0,
             },
         ];
         let map = FrameTimingMap::from_entries(
@@ -1601,5 +1923,41 @@ mod tests {
         assert_eq!(analysis.actual_keyframe_start, 10);
         assert_eq!(analysis.pre_roll_frames, 5);
         assert!(analysis.warning_message.is_some());
+    }
+
+    #[test]
+    fn test_remove_virtual_time_ranges_and_bitrate_stats() {
+        let mut src = sample_source(90, 30);
+        if let Some(entries) = std::sync::Arc::get_mut(&mut src.timing.entries) {
+            for (idx, e) in entries.iter_mut().enumerate() {
+                e.packet_size_bytes = if e.is_keyframe {
+                    40_000
+                } else {
+                    8_000 + (idx as u32 % 4) * 1_000
+                };
+            }
+        }
+        let mut proj = Project::from_primary_source(src);
+        let stats = proj.gop_and_bitrate_stats().unwrap();
+        assert_eq!(stats.keyframe_count, 3);
+        assert_eq!(stats.avg_gop_frames, 30.0);
+        assert_eq!(stats.peak_packet_bytes, 40_000);
+        let samples = proj.sample_timeline_bitrate_range(0, 90, 9);
+        assert_eq!(samples.len(), 9);
+        assert!(samples[0].has_keyframe);
+        assert_eq!(samples[0].max_packet_bytes, 40_000);
+
+        // Remove [1.0s, 2.0s) => frames [30, 60) from a 30fps 90-frame timeline.
+        let removed = proj
+            .remove_virtual_time_ranges(&[(
+                TimestampUs::from_seconds_f64(1.0),
+                TimestampUs::from_seconds_f64(2.0),
+            )])
+            .unwrap();
+        assert_eq!(removed, 30);
+        assert_eq!(proj.total_frames(), 60);
+        assert_eq!(proj.resolve_frame(30).unwrap().source_frame, 60);
+        assert!(proj.undo());
+        assert_eq!(proj.total_frames(), 90);
     }
 }
