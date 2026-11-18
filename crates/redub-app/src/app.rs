@@ -15,19 +15,21 @@ use redub_export::{
     start_animated_gif_or_webp_export_job, start_audio_only_export_job, start_batch_queue,
     start_export_job, start_image_sequence_export_job, start_split_by_markers_export_job,
     AudioChannelMode, AudioProcessingMode, AutomationScript, BatchEvent, BatchItemStatus,
-    BatchJobHandle, BatchJobItem, ContainerFormat, EncodingPreset, ExportEvent, ExportJobHandle,
-    ExportSettings, KeyframeCutPolicy, VideoPixelFormat, VideoProcessingMode, VideoRateControlMode,
+    BatchJobHandle, BatchJobItem, ContainerFormat, CutDubWorkspace, EncodingPreset, ExportEvent,
+    ExportJobHandle, ExportSettings, KeyframeCutPolicy, VideoPixelFormat, VideoProcessingMode,
+    VideoRateControlMode,
 };
 use redub_filters::{
-    compute_rgba_histogram, AspectRatioMode, ConvolutionPreset, DeinterlaceEngine,
-    DeinterlaceMode, DenoiseMode, FieldParity, FilterKind, FilterPipeline, FrameHistogram,
-    OverlayPosition, ResizeSpecMode, RotationAngle, ScalingAlgorithm, SharpenMode,
+    compute_rgba_scopes, AspectRatioMode, ConvolutionPreset, DeinterlaceEngine, DeinterlaceMode,
+    DenoiseMode, FieldParity, FilterKind, FilterPipeline, FrameHistogram, OverlayPosition,
+    ResizeSpecMode, RotationAngle, ScalingAlgorithm, SharpenMode,
 };
 use redub_media::{
     detect_audio_silence, detect_scenes_and_black_frames, export_frame_snapshot,
-    extract_audio_waveform, generate_synthetic_video, probe_local_keyframes, probe_media_file,
-    probe_packet_timing_map, DetectedSceneMarker, FfmpegProcessDecoder, MediaCapabilities,
-    SceneMarkerKind,
+    extract_audio_waveform, generate_synthetic_video, measure_audio_loudness,
+    measure_video_quality, probe_local_keyframes, probe_media_file, probe_packet_timing_map,
+    AudioLoudnessReport, DetectedSceneMarker, FfmpegProcessDecoder, MediaCapabilities,
+    QualityComparisonReport, SceneMarkerKind,
 };
 use redub_platform::{AppPaths, AppSettings, FfmpegBinaries};
 use redub_preview::{AudioPreviewPlayer, NavigationHint, PlaybackClock, PreviewEngine};
@@ -41,6 +43,13 @@ struct PreviewLatency {
     histogram_ms: f64,
     texture_ms: f64,
     cached: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VideoScopeMode {
+    Histogram,
+    LumaWaveform,
+    Vectorscope,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +122,18 @@ pub struct CutDubApp {
     preview_latency: Option<PreviewLatency>,
     current_histogram: Option<FrameHistogram>,
     show_histogram: bool,
+    scope_mode: VideoScopeMode,
+
+    // Workspace save/restore, quality analyzer & loudness meter
+    current_project_path: Option<PathBuf>,
+    last_exported_path: Option<PathBuf>,
+    quality_compare_path: Option<PathBuf>,
+    quality_report: Option<QualityComparisonReport>,
+    quality_rx: Option<Receiver<Result<QualityComparisonReport, String>>>,
+    is_measuring_quality: bool,
+    loudness_report: Option<AudioLoudnessReport>,
+    loudness_rx: Option<Receiver<Result<AudioLoudnessReport, String>>>,
+    is_measuring_loudness: bool,
 
     preview_layout: PreviewLayoutMode,
     preview_zoom: PreviewZoom,
@@ -231,6 +252,16 @@ impl CutDubApp {
             preview_latency: None,
             current_histogram: None,
             show_histogram: true,
+            scope_mode: VideoScopeMode::Histogram,
+            current_project_path: None,
+            last_exported_path: None,
+            quality_compare_path: None,
+            quality_report: None,
+            quality_rx: None,
+            is_measuring_quality: false,
+            loudness_report: None,
+            loudness_rx: None,
+            is_measuring_loudness: false,
             preview_layout: PreviewLayoutMode::DualSideBySide,
             preview_zoom: PreviewZoom::FitToPanel,
             show_right_sidebar: true,
@@ -441,7 +472,11 @@ impl CutDubApp {
             return;
         };
 
-        let (vf, _, _) = self.filters.to_ffmpeg_filtergraph(clip.width, clip.height);
+        let (vf, _, _) = self.filters.to_ffmpeg_filtergraph_for_range(
+            clip.width,
+            clip.height,
+            Some((resolved.virtual_frame, resolved.virtual_frame + 1)),
+        );
         match export_frame_snapshot(&bins, &clip, resolved.source_frame, vf.as_deref(), &out_path) {
             Ok(()) => {
                 self.set_status(
@@ -632,6 +667,40 @@ impl CutDubApp {
             }
         }
 
+        // 1b-3. Poll background SSIM/PSNR quality analyzer & LUFS loudness scanner
+        if let Some(rx) = &self.quality_rx {
+            if let Ok(res) = rx.try_recv() {
+                self.is_measuring_quality = false;
+                self.quality_rx = None;
+                match res {
+                    Ok(rep) => {
+                        self.quality_report = Some(rep);
+                        self.set_status("Quality analysis (SSIM / PSNR) complete.", false);
+                    }
+                    Err(e) => {
+                        self.set_status(format!("Quality analysis failed: {e}"), true);
+                    }
+                }
+                ctx.request_repaint();
+            }
+        }
+        if let Some(rx) = &self.loudness_rx {
+            if let Ok(res) = rx.try_recv() {
+                self.is_measuring_loudness = false;
+                self.loudness_rx = None;
+                match res {
+                    Ok(rep) => {
+                        self.loudness_report = Some(rep);
+                        self.set_status("Audio loudness (LUFS / True Peak) scan complete.", false);
+                    }
+                    Err(e) => {
+                        self.set_status(format!("Loudness scan failed: {e}"), true);
+                    }
+                }
+                ctx.request_repaint();
+            }
+        }
+
         // 1c. Poll active batch processing queue
         let mut clear_batch = false;
         let mut batch_status_msg: Option<(String, bool)> = None;
@@ -714,6 +783,10 @@ impl CutDubApp {
                         output_path,
                         duration,
                     } => {
+                        if output_path.is_file() {
+                            self.last_exported_path = Some(output_path.clone());
+                            self.quality_compare_path = Some(output_path.clone());
+                        }
                         pending_status = Some((
                             format!(
                                 "Export complete: '{}' ({})",
@@ -808,12 +881,17 @@ impl CutDubApp {
         self.update_preview_textures(ctx);
     }
 
-    fn filter_pipeline_signature(&self) -> u64 {
-        // Lightweight deterministic signature for filter changes so Output texture updates immediately
+    fn filter_pipeline_signature(&self, virtual_frame: u64) -> u64 {
+        // Lightweight deterministic signature for filter changes + per-frame active gating
         let json = serde_json::to_string(&self.filters).unwrap_or_default();
         let mut hash = 14695981039346656037u64;
         for b in json.bytes() {
             hash ^= b as u64;
+            hash = hash.wrapping_mul(1099511628211);
+        }
+        for f in &self.filters.filters {
+            let active_byte = u64::from(f.is_active_at_frame(virtual_frame));
+            hash ^= active_byte;
             hash = hash.wrapping_mul(1099511628211);
         }
         hash
@@ -823,7 +901,7 @@ impl CutDubApp {
         let Some(resolved) = self.project.resolve_frame(self.project.current_frame) else {
             return;
         };
-        let filter_sig = self.filter_pipeline_signature();
+        let filter_sig = self.filter_pipeline_signature(resolved.virtual_frame);
         let target_key = (resolved.source_id, resolved.source_frame, filter_sig);
 
         let source_key = (resolved.source_id, resolved.source_frame);
@@ -879,15 +957,17 @@ impl CutDubApp {
                 // Compute Output preview (applying active filters when in Full Processing mode or when filters are enabled)
                 if !self.filters.is_empty() {
                     let filters_started = Instant::now();
-                    let (out_w, out_h, out_rgba) = self.filters.apply_to_rgba(
+                    let (out_w, out_h, out_rgba) = self.filters.apply_to_rgba_at_frame(
                         decoded.width,
                         decoded.height,
                         (*decoded.rgba).clone(),
+                        Some(resolved.virtual_frame),
                     );
                     sample.filters_ms = filters_started.elapsed().as_secs_f64() * 1000.0;
                     if self.show_histogram {
                         let histogram_started = Instant::now();
-                        self.current_histogram = Some(compute_rgba_histogram(&out_rgba));
+                        self.current_histogram =
+                            Some(compute_rgba_scopes(&out_rgba, out_w, out_h));
                         sample.histogram_ms = histogram_started.elapsed().as_secs_f64() * 1000.0;
                     }
                     let texture_started = Instant::now();
@@ -904,7 +984,11 @@ impl CutDubApp {
                 } else {
                     if self.show_histogram {
                         let histogram_started = Instant::now();
-                        self.current_histogram = Some(compute_rgba_histogram(&decoded.rgba));
+                        self.current_histogram = Some(compute_rgba_scopes(
+                            &decoded.rgba,
+                            decoded.width,
+                            decoded.height,
+                        ));
                         sample.histogram_ms = histogram_started.elapsed().as_secs_f64() * 1000.0;
                     }
                     self.output_texture = self.source_texture.clone();
@@ -1113,6 +1197,26 @@ impl CutDubApp {
                     false,
                 ));
             }
+            if i.key_pressed(Key::S) && !i.modifiers.command && !i.modifiers.ctrl {
+                match self.project.split_at_current_frame() {
+                    Ok(()) => {
+                        self.set_status(
+                            format!("Split segment at frame #{}", self.project.current_frame),
+                            false,
+                        );
+                    }
+                    Err(e) => self.set_status(format!("Split: {e}"), true),
+                }
+            }
+            if i.consume_key(Modifiers::COMMAND, Key::S) {
+                if self.project.is_loaded() {
+                    if let Some(p) = self.current_project_path.clone() {
+                        self.save_workspace_to_path(p);
+                    } else {
+                        self.trigger_save_project_dialog();
+                    }
+                }
+            }
 
             // Delete selection: Delete or Backspace
             if i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace) {
@@ -1150,6 +1254,57 @@ impl CutDubApp {
         }
         if trigger_snapshot {
             self.trigger_snapshot_dialog();
+        }
+    }
+
+    fn save_workspace_to_path(&mut self, path: PathBuf) {
+        let ws = CutDubWorkspace {
+            version: 2,
+            project: self.project.clone(),
+            filters: self.filters.clone(),
+            export_settings: self.export_settings.clone(),
+        };
+        match ws.save_to_file(&path) {
+            Ok(()) => {
+                self.current_project_path = Some(path.clone());
+                self.settings.add_recent_project(path.clone());
+                let _ = self.settings.save(&self.paths);
+                self.set_status(format!("Saved workspace '{}'", path.display()), false);
+            }
+            Err(e) => self.set_status(format!("Project save error: {e}"), true),
+        }
+    }
+
+    fn load_workspace_from_path(&mut self, path: PathBuf) {
+        match CutDubWorkspace::load_from_file(&path) {
+            Ok(ws) => {
+                self.playback.pause();
+                self.project = ws.project;
+                self.filters = ws.filters;
+                self.export_settings = ws.export_settings;
+                self.current_project_path = Some(path.clone());
+                self.displayed_frame_key = None;
+                self.scene_markers.clear();
+                self.quality_report = None;
+                self.loudness_report = None;
+                if let Some(engine) = &mut self.preview_engine {
+                    engine.reset();
+                }
+                self.settings.add_recent_project(path.clone());
+                let _ = self.settings.save(&self.paths);
+                self.set_status(format!("Loaded workspace '{}'", path.display()), false);
+            }
+            Err(e) => self.set_status(format!("Project load error: {e}"), true),
+        }
+    }
+
+    fn trigger_save_project_dialog(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .set_file_name("project.cutdub.json")
+            .add_filter("CutDub Project", &["json"])
+            .save_file()
+        {
+            self.save_workspace_to_path(path);
         }
     }
 
@@ -1212,39 +1367,46 @@ impl CutDubApp {
                         .add_filter("CutDub Project", &["json"])
                         .pick_file()
                     {
-                        match Project::load_from_file(&path) {
-                            Ok(proj) => {
-                                self.project = proj;
-                                self.set_status(
-                                    format!("Loaded project '{}'", path.display()),
-                                    false,
-                                );
+                        self.load_workspace_from_path(path);
+                    }
+                }
+                ui.menu_button("Recent Projects", |ui| {
+                    let recents = self.settings.recent_projects.clone();
+                    if recents.is_empty() {
+                        ui.label("No recent projects");
+                    } else {
+                        for path in recents {
+                            let label = path.display().to_string();
+                            if ui.button(label).clicked() {
+                                ui.close_menu();
+                                self.load_workspace_from_path(path);
                             }
-                            Err(e) => self.set_status(format!("Project load error: {e}"), true),
                         }
+                    }
+                });
+                if ui
+                    .add_enabled(
+                        self.project.is_loaded(),
+                        egui::Button::new("Save Project (Cmd/Ctrl+S)"),
+                    )
+                    .clicked()
+                {
+                    ui.close_menu();
+                    if let Some(p) = self.current_project_path.clone() {
+                        self.save_workspace_to_path(p);
+                    } else {
+                        self.trigger_save_project_dialog();
                     }
                 }
                 if ui
                     .add_enabled(
                         self.project.is_loaded(),
-                        egui::Button::new("Save Project (.cutdub.json)..."),
+                        egui::Button::new("Save Project As (.cutdub.json)..."),
                     )
                     .clicked()
                 {
                     ui.close_menu();
-                    if let Some(path) = rfd::FileDialog::new()
-                        .set_file_name("project.cutdub.json")
-                        .add_filter("CutDub Project", &["json"])
-                        .save_file()
-                    {
-                        match self.project.save_to_file(&path) {
-                            Ok(()) => self.set_status(
-                                format!("Saved project to '{}'", path.display()),
-                                false,
-                            ),
-                            Err(e) => self.set_status(format!("Project save error: {e}"), true),
-                        }
-                    }
+                    self.trigger_save_project_dialog();
                 }
 
                 ui.separator();
@@ -1324,6 +1486,22 @@ impl CutDubApp {
                 }
 
                 ui.separator();
+                if ui
+                    .add_enabled(
+                        self.project.is_loaded(),
+                        egui::Button::new("Split Segment at Playhead (S)"),
+                    )
+                    .clicked()
+                {
+                    ui.close_menu();
+                    match self.project.split_at_current_frame() {
+                        Ok(()) => self.set_status(
+                            format!("Split segment at frame #{}", self.project.current_frame),
+                            false,
+                        ),
+                        Err(e) => self.set_status(format!("Split: {e}"), true),
+                    }
+                }
                 if ui
                     .add_enabled(
                         self.project.selection_range().is_some(),
@@ -2491,6 +2669,33 @@ impl CutDubApp {
                 }
             }
 
+            // Draw enabled Per-Filter Active Frame Range spans along the upper timeline
+            let timeline_last = total_frames.saturating_sub(1);
+            for (r_idx, f_inst) in self
+                .filters
+                .filters
+                .iter()
+                .filter(|f| f.enabled && f.has_frame_range())
+                .enumerate()
+            {
+                let (opt_s, opt_e) = f_inst.normalized_range();
+                let rs = opt_s.unwrap_or(0);
+                let re = opt_e.unwrap_or(timeline_last).min(timeline_last);
+                if re >= rs && re >= vis_start && rs < vis_end {
+                    let x0 = frame_to_x(rs.max(vis_start));
+                    let x1 = frame_to_x(re.min(vis_end.saturating_sub(1)));
+                    let y0 = rect.top() + 3.0 + ((r_idx % 3) as f32) * 5.0;
+                    painter.rect_filled(
+                        Rect::from_min_max(
+                            Pos2::new(x0, y0),
+                            Pos2::new(x1.max(x0 + 3.0), y0 + 3.5),
+                        ),
+                        1.0,
+                        Color32::from_rgba_unmultiplied(155, 115, 245, 185),
+                    );
+                }
+            }
+
             // Draw Keyframe tick marks along bottom edge within [vis_start, vis_end)
             let max_ticks = (rect.width() / 3.0) as usize;
             let step = (vis_span as usize / max_ticks.max(1)).max(1) as u64;
@@ -2724,6 +2929,20 @@ impl CutDubApp {
                 .clicked()
             {
                 self.project.set_mark_out();
+            }
+
+            if ui
+                .add_enabled(self.project.is_loaded(), egui::Button::new("✂ Split (S)"))
+                .on_hover_text("Split the active segment at the playhead (S)")
+                .clicked()
+            {
+                match self.project.split_at_current_frame() {
+                    Ok(()) => self.set_status(
+                        format!("Split segment at frame #{}", self.project.current_frame),
+                        false,
+                    ),
+                    Err(e) => self.set_status(format!("Split: {e}"), true),
+                }
             }
 
             let has_sel = self.project.selection_range().is_some();
@@ -3102,6 +3321,91 @@ impl CutDubApp {
                 );
             }
         }
+
+        ui.add_space(12.0);
+        ui.separator();
+        ui.heading("Compression Quality Analyzer (SSIM / PSNR)");
+        ui.label(
+            RichText::new(
+                "Compare an exported video against this source clip to measure SSIM and PSNR.",
+            )
+            .size(11.5)
+            .weak(),
+        );
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("📂 Choose Exported File...").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Video Files", &["mp4", "mkv", "mov", "avi", "webm"])
+                    .pick_file()
+                {
+                    self.quality_compare_path = Some(path);
+                    self.quality_report = None;
+                }
+            }
+            if let Some(cmp) = &self.quality_compare_path {
+                let name = cmp
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("exported");
+                ui.label(RichText::new(name).monospace().size(11.0));
+            }
+        });
+        ui.horizontal(|ui| {
+            let can_measure = !self.is_measuring_quality && self.quality_compare_path.is_some();
+            if ui
+                .add_enabled(can_measure, egui::Button::new("📊 Measure SSIM & PSNR"))
+                .clicked()
+            {
+                if let (Some(bins), Some(cmp_path)) =
+                    (self.binaries.clone(), self.quality_compare_path.clone())
+                {
+                    let ref_path = primary.path.clone();
+                    let (tx, rx) = mpsc::channel();
+                    self.quality_rx = Some(rx);
+                    self.is_measuring_quality = true;
+                    self.set_status("Measuring SSIM & PSNR against source...", false);
+                    thread::Builder::new()
+                        .name("cutdub-quality-analyzer".into())
+                        .spawn(move || {
+                            let res = measure_video_quality(&bins, &cmp_path, &ref_path, Some(60.0))
+                                .map_err(|e| e.to_string());
+                            let _ = tx.send(res);
+                        })
+                        .ok();
+                }
+            }
+            if self.is_measuring_quality {
+                ui.spinner();
+                ui.label("Analyzing...");
+            }
+        });
+        if let Some(rep) = &self.quality_report {
+            ui.group(|ui| {
+                if let Some(ssim) = rep.ssim_all {
+                    let db_txt = rep
+                        .ssim_db
+                        .map(|d| format!(" ({d:.2} dB)"))
+                        .unwrap_or_default();
+                    ui.label(
+                        RichText::new(format!("SSIM All: {ssim:.5}{db_txt}"))
+                            .monospace()
+                            .strong()
+                            .color(Color32::from_rgb(115, 225, 165)),
+                    );
+                }
+                if let Some(psnr) = rep.psnr_avg {
+                    let y_txt = rep
+                        .psnr_y
+                        .map(|y| format!("  |  Y: {y:.2} dB"))
+                        .unwrap_or_default();
+                    ui.label(
+                        RichText::new(format!("PSNR Avg: {psnr:.2} dB{y_txt}"))
+                            .monospace()
+                            .color(Color32::from_rgb(135, 200, 250)),
+                    );
+                }
+            });
+        }
     }
 
     fn render_filters_panel(&mut self, ui: &mut Ui) {
@@ -3440,9 +3744,14 @@ impl CutDubApp {
         let stage_dims: Vec<(u32, u32)> = (0..filter_len)
             .map(|i| self.filters.input_dimensions_at(i, src_w, src_h))
             .collect();
+        let cur_vf = self.project.current_frame;
+        let max_vf = self.project.total_frames().saturating_sub(1);
+        let sel_range = self.project.selection_range();
 
         for (idx, instance) in self.filters.filters.iter_mut().enumerate() {
             let (in_w, in_h) = stage_dims.get(idx).copied().unwrap_or((src_w, src_h));
+            let active_at_cur = instance.is_active_at_frame(cur_vf);
+            let range_badge = instance.range_badge();
             ui.group(|ui| {
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut instance.enabled, "");
@@ -3474,6 +3783,17 @@ impl CutDubApp {
                         .clicked()
                     {
                         instance.is_open = !instance.is_open;
+                    }
+
+                    if let Some(badge) = &range_badge {
+                        let (lbl, col) = if !instance.enabled {
+                            (format!("[{badge}]"), ui.visuals().weak_text_color())
+                        } else if active_at_cur {
+                            (format!("[{badge}]"), Color32::from_rgb(95, 225, 210))
+                        } else {
+                            (format!("[{badge} • off]"), Color32::from_rgb(215, 165, 95))
+                        };
+                        ui.label(RichText::new(lbl).monospace().size(10.5).color(col));
                     }
 
                     if !instance.is_open {
@@ -3515,6 +3835,83 @@ impl CutDubApp {
 
                 if instance.is_open {
                     ui.add_space(3.0);
+                    if instance.kind.supports_frame_range() {
+                        ui.horizontal(|ui| {
+                            let mut has_range =
+                                instance.start_frame.is_some() || instance.end_frame.is_some();
+                            if ui
+                                .checkbox(&mut has_range, "Active Frame Range")
+                                .on_hover_text(
+                                    "Restrict this filter to apply only during a specific frame window",
+                                )
+                                .changed()
+                            {
+                                if has_range {
+                                    if let Some((ss, se)) = sel_range {
+                                        instance.start_frame = Some(ss);
+                                        instance.end_frame = Some(se.saturating_sub(1));
+                                    } else {
+                                        instance.start_frame = Some(cur_vf);
+                                        instance.end_frame = Some((cur_vf + 60).min(max_vf));
+                                    }
+                                } else {
+                                    instance.start_frame = None;
+                                    instance.end_frame = None;
+                                }
+                            }
+                        });
+                        if instance.start_frame.is_some() || instance.end_frame.is_some() {
+                            ui.horizontal_wrapped(|ui| {
+                                let mut s_val = instance.start_frame.unwrap_or(0).min(max_vf);
+                                let mut e_val = instance.end_frame.unwrap_or(max_vf).min(max_vf);
+                                ui.label("Start:");
+                                if ui
+                                    .add(egui::DragValue::new(&mut s_val).range(0..=max_vf).speed(1))
+                                    .changed()
+                                {
+                                    instance.start_frame = Some(s_val);
+                                }
+                                if ui.small_button("[Set").on_hover_text("Set start to playhead").clicked() {
+                                    instance.start_frame = Some(cur_vf.min(max_vf));
+                                }
+                                ui.label("End:");
+                                if ui
+                                    .add(egui::DragValue::new(&mut e_val).range(0..=max_vf).speed(1))
+                                    .changed()
+                                {
+                                    instance.end_frame = Some(e_val);
+                                }
+                                if ui.small_button("Set]").on_hover_text("Set end to playhead").clicked() {
+                                    instance.end_frame = Some(cur_vf.min(max_vf));
+                                }
+                                if let Some((ss, se)) = sel_range {
+                                    if ui
+                                        .small_button("Use Sel")
+                                        .on_hover_text("Copy active timeline selection [In..Out]")
+                                        .clicked()
+                                    {
+                                        instance.start_frame = Some(ss);
+                                        instance.end_frame = Some(se.saturating_sub(1));
+                                    }
+                                }
+                                if ui
+                                    .small_button("Full")
+                                    .on_hover_text("Apply filter to the entire clip")
+                                    .clicked()
+                                {
+                                    instance.start_frame = None;
+                                    instance.end_frame = None;
+                                }
+                            });
+                        }
+                    } else {
+                        ui.label(
+                            RichText::new("Full clip only (geometry / timing filter)")
+                                .size(10.5)
+                                .weak(),
+                        );
+                    }
+                    ui.separator();
                     match &mut instance.kind {
                     FilterKind::Crop {
                         left,
@@ -4341,37 +4738,69 @@ impl CutDubApp {
                     self.project.resolve_frame(self.project.current_frame),
                 ) {
                     if let Some(clip) = self.project.source_by_id(resolved.source_id).cloned() {
-                        let dec = FfmpegProcessDecoder::new(bins, self.settings.prefer_hardware_decode);
-                        if let Ok(exact) = dec.decode_filtered_frame(
-                            &clip,
-                            resolved.source_frame,
-                            &vf,
-                            out_w,
-                            out_h,
-                        ) {
-                            let img = ColorImage::from_rgba_unmultiplied(
-                                [exact.width as usize, exact.height as usize],
-                                &exact.rgba,
+                        let (frame_vf, exact_w, exact_h) =
+                            self.filters.to_ffmpeg_filtergraph_for_range(
+                                clip.width,
+                                clip.height,
+                                Some((resolved.virtual_frame, resolved.virtual_frame + 1)),
                             );
-                            self.output_texture = Some(ui.ctx().load_texture(
-                                "cutdub_output_exact",
-                                img,
-                                TextureOptions::LINEAR,
-                            ));
+                        if let Some(fvf) = frame_vf {
+                            let dec = FfmpegProcessDecoder::new(
+                                bins,
+                                self.settings.prefer_hardware_decode,
+                            );
+                            if let Ok(exact) = dec.decode_filtered_frame(
+                                &clip,
+                                resolved.source_frame,
+                                &fvf,
+                                exact_w,
+                                exact_h,
+                            ) {
+                                let img = ColorImage::from_rgba_unmultiplied(
+                                    [exact.width as usize, exact.height as usize],
+                                    &exact.rgba,
+                                );
+                                self.output_texture = Some(ui.ctx().load_texture(
+                                    "cutdub_output_exact",
+                                    img,
+                                    TextureOptions::LINEAR,
+                                ));
+                            }
+                        } else {
+                            self.output_texture = self.source_texture.clone();
                         }
                     }
                 }
             }
         }
 
-        // Live RGB + Luma Histogram & Clipping Scope
+        // Live Video Scopes: RGB+Luma Histogram, Luma Waveform Monitor & UV Vectorscope
         ui.add_space(10.0);
         ui.separator();
-        ui.checkbox(&mut self.show_histogram, "Show Live RGB / Luma Histogram Scope");
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.show_histogram, "Video Scopes:");
+            if self.show_histogram {
+                ui.selectable_value(&mut self.scope_mode, VideoScopeMode::Histogram, "Histogram");
+                ui.selectable_value(
+                    &mut self.scope_mode,
+                    VideoScopeMode::LumaWaveform,
+                    "Waveform",
+                );
+                ui.selectable_value(
+                    &mut self.scope_mode,
+                    VideoScopeMode::Vectorscope,
+                    "Vectorscope",
+                );
+            }
+        });
         if self.show_histogram {
             if let Some(hist) = &self.current_histogram {
                 let scope_w = ui.available_width();
-                let scope_h = 84.0;
+                let scope_h = match self.scope_mode {
+                    VideoScopeMode::Histogram => 84.0,
+                    VideoScopeMode::LumaWaveform => 96.0,
+                    VideoScopeMode::Vectorscope => 128.0,
+                };
                 let (rect, _) = ui.allocate_exact_size(Vec2::new(scope_w, scope_h), Sense::hover());
                 let painter = ui.painter_at(rect);
                 painter.rect_filled(rect, 3.0, Color32::from_rgb(13, 15, 19));
@@ -4382,33 +4811,129 @@ impl CutDubApp {
                     StrokeKind::Inside,
                 );
 
-                let col_w = (rect.width() / 64.0).max(1.0);
-                for i in 0..64 {
-                    let x = rect.left() + i as f32 * col_w;
-                    let bot = rect.bottom() - 2.0;
-                    let max_h = rect.height() - 6.0;
+                match self.scope_mode {
+                    VideoScopeMode::Histogram => {
+                        let col_w = (rect.width() / 64.0).max(1.0);
+                        for i in 0..64 {
+                            let x = rect.left() + i as f32 * col_w;
+                            let bot = rect.bottom() - 2.0;
+                            let max_h = rect.height() - 6.0;
 
-                    let r_y = bot - hist.r_bins[i] * max_h;
-                    let g_y = bot - hist.g_bins[i] * max_h;
-                    let b_y = bot - hist.b_bins[i] * max_h;
-                    let l_y = bot - hist.luma_bins[i] * max_h;
+                            let r_y = bot - hist.r_bins[i] * max_h;
+                            let g_y = bot - hist.g_bins[i] * max_h;
+                            let b_y = bot - hist.b_bins[i] * max_h;
+                            let l_y = bot - hist.luma_bins[i] * max_h;
 
-                    painter.line_segment(
-                        [Pos2::new(x, bot), Pos2::new(x, r_y)],
-                        Stroke::new(col_w * 0.85, Color32::from_rgba_unmultiplied(235, 75, 75, 85)),
-                    );
-                    painter.line_segment(
-                        [Pos2::new(x, bot), Pos2::new(x, g_y)],
-                        Stroke::new(col_w * 0.85, Color32::from_rgba_unmultiplied(75, 225, 110, 85)),
-                    );
-                    painter.line_segment(
-                        [Pos2::new(x, bot), Pos2::new(x, b_y)],
-                        Stroke::new(col_w * 0.85, Color32::from_rgba_unmultiplied(85, 145, 245, 85)),
-                    );
-                    painter.line_segment(
-                        [Pos2::new(x, l_y), Pos2::new(x + col_w, l_y)],
-                        Stroke::new(1.4_f32, Color32::from_rgb(230, 235, 245)),
-                    );
+                            painter.line_segment(
+                                [Pos2::new(x, bot), Pos2::new(x, r_y)],
+                                Stroke::new(
+                                    col_w * 0.85,
+                                    Color32::from_rgba_unmultiplied(235, 75, 75, 85),
+                                ),
+                            );
+                            painter.line_segment(
+                                [Pos2::new(x, bot), Pos2::new(x, g_y)],
+                                Stroke::new(
+                                    col_w * 0.85,
+                                    Color32::from_rgba_unmultiplied(75, 225, 110, 85),
+                                ),
+                            );
+                            painter.line_segment(
+                                [Pos2::new(x, bot), Pos2::new(x, b_y)],
+                                Stroke::new(
+                                    col_w * 0.85,
+                                    Color32::from_rgba_unmultiplied(85, 145, 245, 85),
+                                ),
+                            );
+                            painter.line_segment(
+                                [Pos2::new(x, l_y), Pos2::new(x + col_w, l_y)],
+                                Stroke::new(1.4_f32, Color32::from_rgb(230, 235, 245)),
+                            );
+                        }
+                    }
+                    VideoScopeMode::LumaWaveform => {
+                        for pct in [0.25_f32, 0.5, 0.75] {
+                            let gy = rect.bottom() - 3.0 - pct * (rect.height() - 6.0);
+                            painter.line_segment(
+                                [Pos2::new(rect.left() + 2.0, gy), Pos2::new(rect.right() - 2.0, gy)],
+                                Stroke::new(0.8_f32, Color32::from_rgba_unmultiplied(90, 100, 120, 70)),
+                            );
+                        }
+                        if hist.luma_waveform.len() == 64 * 32 {
+                            let cell_w = (rect.width() - 4.0) / 64.0;
+                            let cell_h = (rect.height() - 6.0) / 32.0;
+                            for row in 0..32 {
+                                for col in 0..64 {
+                                    let val = hist.luma_waveform[row * 64 + col];
+                                    if val == 0 {
+                                        continue;
+                                    }
+                                    let x0 = rect.left() + 2.0 + col as f32 * cell_w;
+                                    let y1 = rect.bottom() - 3.0 - row as f32 * cell_h;
+                                    let y0 = y1 - cell_h;
+                                    painter.rect_filled(
+                                        Rect::from_min_max(
+                                            Pos2::new(x0, y0),
+                                            Pos2::new(x0 + cell_w + 0.5, y1 + 0.5),
+                                        ),
+                                        0.0,
+                                        Color32::from_rgba_unmultiplied(85, 235, 170, val),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    VideoScopeMode::Vectorscope => {
+                        let sq = rect.height().min(rect.width()) - 6.0;
+                        let vs_rect = Rect::from_center_size(rect.center(), Vec2::splat(sq));
+                        let radius = sq * 0.48;
+                        painter.circle_stroke(
+                            vs_rect.center(),
+                            radius,
+                            Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(95, 110, 130, 100)),
+                        );
+                        painter.line_segment(
+                            [
+                                Pos2::new(vs_rect.center().x - radius, vs_rect.center().y),
+                                Pos2::new(vs_rect.center().x + radius, vs_rect.center().y),
+                            ],
+                            Stroke::new(0.8_f32, Color32::from_rgba_unmultiplied(95, 110, 130, 75)),
+                        );
+                        painter.line_segment(
+                            [
+                                Pos2::new(vs_rect.center().x, vs_rect.center().y - radius),
+                                Pos2::new(vs_rect.center().x, vs_rect.center().y + radius),
+                            ],
+                            Stroke::new(0.8_f32, Color32::from_rgba_unmultiplied(95, 110, 130, 75)),
+                        );
+                        if hist.vectorscope.len() == 48 * 48 {
+                            let cw = sq / 48.0;
+                            for vy in 0..48 {
+                                for vx in 0..48 {
+                                    let val = hist.vectorscope[vy * 48 + vx];
+                                    if val == 0 {
+                                        continue;
+                                    }
+                                    let x0 = vs_rect.left() + vx as f32 * cw;
+                                    let y0 = vs_rect.top() + vy as f32 * cw;
+                                    // Tint dot by quadrant angle (Cb/Cr)
+                                    let r_c = ((47 - vy) * 255 / 47) as u8;
+                                    let b_c = (vx * 255 / 47) as u8;
+                                    let g_c = (255u16.saturating_sub((r_c as u16 + b_c as u16) / 2)) as u8;
+                                    painter.rect_filled(
+                                        Rect::from_min_size(Pos2::new(x0, y0), Vec2::splat(cw + 0.6)),
+                                        0.0,
+                                        Color32::from_rgba_unmultiplied(
+                                            r_c.max(80),
+                                            g_c.max(110),
+                                            b_c.max(80),
+                                            val,
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
 
                 ui.horizontal(|ui| {
@@ -5237,6 +5762,87 @@ impl CutDubApp {
                     &mut self.export_settings.audio_normalize_loudness,
                     "EBU R128 Loudness Normalization (-16 LUFS / -1.5 dBTP)",
                 );
+                ui.horizontal(|ui| {
+                    ui.label("High-Pass Rumble Cut:");
+                    ui.selectable_value(&mut self.export_settings.audio_highpass_hz, None, "Off");
+                    ui.selectable_value(
+                        &mut self.export_settings.audio_highpass_hz,
+                        Some(80),
+                        "80 Hz",
+                    );
+                    ui.selectable_value(
+                        &mut self.export_settings.audio_highpass_hz,
+                        Some(120),
+                        "120 Hz",
+                    );
+                });
+                ui.checkbox(
+                    &mut self.export_settings.audio_denoise_afftdn,
+                    "FFT Audio Denoise (afftdn hiss/hum reduction)",
+                );
+                ui.checkbox(
+                    &mut self.export_settings.audio_compressor,
+                    "Dynamics Compressor (even out speech & peaks)",
+                );
+
+                ui.horizontal(|ui| {
+                    let can_lufs = !self.is_measuring_loudness
+                        && self
+                            .project
+                            .primary_source()
+                            .map(|c| !c.audio_streams.is_empty())
+                            .unwrap_or(false);
+                    if ui
+                        .add_enabled(can_lufs, egui::Button::new("📏 Measure LUFS & True Peak"))
+                        .clicked()
+                    {
+                        if let (Some(bins), Some(clip)) = (
+                            self.binaries.clone(),
+                            self.project.primary_source().cloned(),
+                        ) {
+                            if let Some(a_stream) = clip.audio_streams.first() {
+                                let a_idx = a_stream.stream_index;
+                                let dur = self
+                                    .project
+                                    .total_duration()
+                                    .as_seconds_f64()
+                                    .clamp(0.5, 120.0);
+                                let (tx, rx) = mpsc::channel();
+                                self.loudness_rx = Some(rx);
+                                self.is_measuring_loudness = true;
+                                self.set_status("Scanning audio loudness (EBU R128)...", false);
+                                thread::Builder::new()
+                                    .name("cutdub-lufs-scan".into())
+                                    .spawn(move || {
+                                        let res = measure_audio_loudness(
+                                            &bins,
+                                            &clip.path,
+                                            a_idx,
+                                            TimestampUs::ZERO,
+                                            dur,
+                                        )
+                                        .map_err(|e| e.to_string());
+                                        let _ = tx.send(res);
+                                    })
+                                    .ok();
+                            }
+                        }
+                    }
+                    if self.is_measuring_loudness {
+                        ui.spinner();
+                    }
+                });
+                if let Some(rep) = &self.loudness_report {
+                    ui.label(
+                        RichText::new(format!(
+                            "Measured: {:.1} LUFS  |  True Peak: {:.1} dBTP  |  LRA: {:.1} LU",
+                            rep.integrated_lufs, rep.true_peak_dbtp, rep.lra_lu
+                        ))
+                        .monospace()
+                        .size(11.0)
+                        .color(Color32::from_rgb(130, 215, 185)),
+                    );
+                }
             });
         }
 
@@ -5633,8 +6239,26 @@ impl CutDubApp {
             return;
         }
 
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(self.project.is_loaded(), egui::Button::new("✂ Split Segment at Playhead (S)"))
+                .clicked()
+            {
+                match self.project.split_at_current_frame() {
+                    Ok(()) => self.set_status(
+                        format!("Split segment at frame #{}", self.project.current_frame),
+                        false,
+                    ),
+                    Err(e) => self.set_status(format!("Split: {e}"), true),
+                }
+            }
+        });
+        ui.add_space(4.0);
+
         let mut v_cursor = 0u64;
         let mut jump_to = None;
+        let mut seg_action: Option<(usize, &str)> = None;
+        let seg_count = self.project.segments.len();
         for (idx, seg) in self.project.segments.iter().enumerate() {
             let count = seg.frame_count();
             let v_start = v_cursor;
@@ -5652,6 +6276,34 @@ impl CutDubApp {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(format!("Segment #{idx}")).strong());
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .add_enabled(seg_count > 1, egui::Button::new("✖").small())
+                            .on_hover_text("Remove segment (Undoable)")
+                            .clicked()
+                        {
+                            seg_action = Some((idx, "remove"));
+                        }
+                        if ui
+                            .small_button("📋")
+                            .on_hover_text("Duplicate segment")
+                            .clicked()
+                        {
+                            seg_action = Some((idx, "dup"));
+                        }
+                        if ui
+                            .add_enabled(idx + 1 < seg_count, egui::Button::new("⬇").small())
+                            .on_hover_text("Move segment later")
+                            .clicked()
+                        {
+                            seg_action = Some((idx, "down"));
+                        }
+                        if ui
+                            .add_enabled(idx > 0, egui::Button::new("⬆").small())
+                            .on_hover_text("Move segment earlier")
+                            .clicked()
+                        {
+                            seg_action = Some((idx, "up"));
+                        }
                         if ui.small_button("Seek").clicked() {
                             jump_to = Some(v_start);
                         }
@@ -5681,6 +6333,19 @@ impl CutDubApp {
             });
         }
 
+        if let Some((idx, act)) = seg_action {
+            let res = match act {
+                "up" => self.project.move_segment(idx, -1),
+                "down" => self.project.move_segment(idx, 1),
+                "dup" => self.project.duplicate_segment(idx),
+                "remove" => self.project.remove_segment(idx),
+                _ => Ok(()),
+            };
+            match res {
+                Ok(()) => self.displayed_frame_key = None,
+                Err(e) => self.set_status(format!("Segment edit: {e}"), true),
+            }
+        }
         if let Some(target) = jump_to {
             self.playback.pause();
             self.project.current_frame = target;
@@ -6297,7 +6962,7 @@ impl CutDubApp {
                 .collapsible(false)
                 .resizable(false)
                 .show(ctx, |ui| {
-                    ui.heading("CutDub (ReDub)");
+                    ui.heading(format!("CutDub (ReDub) v{}", env!("CARGO_PKG_VERSION")));
                     ui.label("Modern Cross-Platform Precision Video Processor & VirtualDub2 Successor");
                     ui.add_space(6.0);
                     ui.label("Built with Rust, egui/eframe (wgpu), and FFmpeg.");

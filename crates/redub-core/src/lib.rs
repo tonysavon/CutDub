@@ -1383,6 +1383,94 @@ impl Project {
             .min(self.total_frames().saturating_sub(1));
     }
 
+    /// Splits the segment under `self.current_frame` into two segments at the playhead (Razor Split).
+    pub fn split_at_current_frame(&mut self) -> Result<(), CoreError> {
+        if !self.is_loaded() {
+            return Err(CoreError::NoMediaLoaded);
+        }
+        let target_vf = self.current_frame;
+        let mut cursor = 0u64;
+        for idx in 0..self.segments.len() {
+            let seg = self.segments[idx];
+            let seg_len = seg.frame_count();
+            let v_start = cursor;
+            let v_end = cursor + seg_len;
+            if target_vf > v_start && target_vf < v_end {
+                let offset = target_vf - v_start;
+                let split_src_frame = seg.start_frame + offset;
+                self.push_undo(format!("Split segment #{idx} at frame {target_vf}"));
+                let left = EditSegment {
+                    source_id: seg.source_id,
+                    start_frame: seg.start_frame,
+                    end_frame: split_src_frame,
+                };
+                let right = EditSegment {
+                    source_id: seg.source_id,
+                    start_frame: split_src_frame,
+                    end_frame: seg.end_frame,
+                };
+                self.segments[idx] = left;
+                self.segments.insert(idx + 1, right);
+                return Ok(());
+            }
+            cursor = v_end;
+        }
+        Err(CoreError::InvalidSelection)
+    }
+
+    /// Moves segment `index` by `delta` (`-1` earlier, `+1` later) with full Undo support.
+    pub fn move_segment(&mut self, index: usize, delta: isize) -> Result<(), CoreError> {
+        if !self.is_loaded() {
+            return Err(CoreError::NoMediaLoaded);
+        }
+        let new_idx = index as isize + delta;
+        if index >= self.segments.len() || new_idx < 0 || new_idx >= self.segments.len() as isize {
+            return Err(CoreError::InvalidSelection);
+        }
+        let target = new_idx as usize;
+        self.push_undo(format!("Move segment #{index} -> #{target}"));
+        self.segments.swap(index, target);
+        self.selection_start = None;
+        self.selection_end = None;
+        Ok(())
+    }
+
+    /// Duplicates segment `index` immediately after itself with full Undo support.
+    pub fn duplicate_segment(&mut self, index: usize) -> Result<(), CoreError> {
+        if !self.is_loaded() {
+            return Err(CoreError::NoMediaLoaded);
+        }
+        if index >= self.segments.len() {
+            return Err(CoreError::InvalidSelection);
+        }
+        self.push_undo(format!("Duplicate segment #{index}"));
+        let seg = self.segments[index];
+        self.segments.insert(index + 1, seg);
+        self.selection_start = None;
+        self.selection_end = None;
+        Ok(())
+    }
+
+    /// Removes segment `index` from the timeline (unless it is the only segment) with full Undo support.
+    pub fn remove_segment(&mut self, index: usize) -> Result<(), CoreError> {
+        if !self.is_loaded() {
+            return Err(CoreError::NoMediaLoaded);
+        }
+        if self.segments.len() <= 1 {
+            return Err(CoreError::CannotDeleteEntireTimeline);
+        }
+        if index >= self.segments.len() {
+            return Err(CoreError::InvalidSelection);
+        }
+        self.push_undo(format!("Remove segment #{index}"));
+        self.segments.remove(index);
+        self.selection_start = None;
+        self.selection_end = None;
+        let max_frame = self.total_frames().saturating_sub(1);
+        self.current_frame = self.current_frame.min(max_frame);
+        Ok(())
+    }
+
     /// Deletes the currently selected virtual frame range `[sel_start, sel_end)` from the timeline.
     pub fn delete_selection(&mut self) -> Result<(), CoreError> {
         if !self.is_loaded() {
@@ -1959,5 +2047,33 @@ mod tests {
         assert_eq!(proj.resolve_frame(30).unwrap().source_frame, 60);
         assert!(proj.undo());
         assert_eq!(proj.total_frames(), 90);
+    }
+
+    #[test]
+    fn test_split_reorder_duplicate_and_remove_segments() {
+        let mut proj = Project::from_primary_source(sample_source(60, 10));
+        proj.current_frame = 20;
+        proj.split_at_current_frame().unwrap();
+        assert_eq!(proj.segments.len(), 2);
+        assert_eq!(proj.segments[0].frame_count(), 20);
+        assert_eq!(proj.segments[1].frame_count(), 40);
+
+        // Swap segments 0 and 1
+        proj.move_segment(0, 1).unwrap();
+        assert_eq!(proj.segments[0].start_frame, 20);
+        assert_eq!(proj.segments[1].start_frame, 0);
+
+        // Duplicate segment 0
+        proj.duplicate_segment(0).unwrap();
+        assert_eq!(proj.segments.len(), 3);
+        assert_eq!(proj.total_frames(), 100);
+
+        // Remove duplicated segment
+        proj.remove_segment(1).unwrap();
+        assert_eq!(proj.segments.len(), 2);
+        assert_eq!(proj.total_frames(), 60);
+
+        assert!(proj.undo());
+        assert_eq!(proj.total_frames(), 100);
     }
 }

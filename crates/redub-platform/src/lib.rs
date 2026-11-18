@@ -259,6 +259,8 @@ pub struct AppSettings {
     #[serde(default)]
     pub last_video_encoder: Option<String>,
     pub recent_files: Vec<PathBuf>,
+    #[serde(default)]
+    pub recent_projects: Vec<PathBuf>,
     pub max_recent_files: usize,
 }
 
@@ -271,6 +273,7 @@ impl Default for AppSettings {
             prefer_hardware_decode: true,
             last_video_encoder: None,
             recent_files: Vec::new(),
+            recent_projects: Vec::new(),
             max_recent_files: 10,
         }
     }
@@ -302,6 +305,14 @@ impl AppSettings {
         self.recent_files.insert(0, path);
         if self.recent_files.len() > self.max_recent_files {
             self.recent_files.truncate(self.max_recent_files);
+        }
+    }
+
+    pub fn add_recent_project(&mut self, path: PathBuf) {
+        self.recent_projects.retain(|p| p != &path);
+        self.recent_projects.insert(0, path);
+        if self.recent_projects.len() > self.max_recent_files {
+            self.recent_projects.truncate(self.max_recent_files);
         }
     }
 }

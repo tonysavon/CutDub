@@ -1038,6 +1038,148 @@ pub fn detect_audio_silence(
     Ok(markers)
 }
 
+/// Video quality comparison metrics (`SSIM` and `PSNR`) between an encoded file and its reference source.
+#[derive(Debug, Clone, Default)]
+pub struct QualityComparisonReport {
+    pub ssim_all: Option<f64>,
+    pub ssim_db: Option<f64>,
+    pub psnr_y: Option<f64>,
+    pub psnr_avg: Option<f64>,
+}
+
+/// Computes `SSIM` and `PSNR` between `distorted_path` and `reference_path` in a single FFmpeg pass.
+pub fn measure_video_quality(
+    binaries: &FfmpegBinaries,
+    distorted_path: &Path,
+    reference_path: &Path,
+    max_duration_secs: Option<f64>,
+) -> Result<QualityComparisonReport, MediaError> {
+    let mut cmd = Command::new(&binaries.ffmpeg_path);
+    configure_background_command(&mut cmd);
+    cmd.args(["-hide_banner", "-nostdin"]);
+    if let Some(d) = max_duration_secs {
+        cmd.args(["-t", &format!("{:.3}", d.max(0.5))]);
+    }
+    cmd.arg("-i").arg(distorted_path);
+    if let Some(d) = max_duration_secs {
+        cmd.args(["-t", &format!("{:.3}", d.max(0.5))]);
+    }
+    cmd.arg("-i").arg(reference_path);
+    cmd.args([
+        "-lavfi",
+        "[0:v]setpts=PTS-STARTPTS[d0];[1:v]setpts=PTS-STARTPTS[r0];[r0][d0]scale2ref[r_s][d_s];[d_s]split[d1][d2];[r_s]split[r1][r2];[d1][r1]ssim;[d2][r2]psnr",
+        "-an",
+        "-sn",
+        "-f",
+        "null",
+        "-",
+    ]);
+
+    let out = cmd.output()?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let mut report = QualityComparisonReport::default();
+
+    for line in stderr.lines() {
+        if line.contains("SSIM") && line.contains("All:") {
+            for tok in line.split_whitespace() {
+                if let Some(v) = tok.strip_prefix("All:") {
+                    report.ssim_all = v.parse::<f64>().ok();
+                } else if tok.starts_with('(') && tok.ends_with(')') {
+                    let inner = tok.trim_start_matches('(').trim_end_matches(')');
+                    if let Ok(db) = inner.parse::<f64>() {
+                        report.ssim_db = Some(db);
+                    }
+                }
+            }
+        } else if line.contains("PSNR") && line.contains("average:") {
+            for tok in line.split_whitespace() {
+                if let Some(v) = tok.strip_prefix("y:") {
+                    report.psnr_y = v.parse::<f64>().ok();
+                } else if let Some(v) = tok.strip_prefix("average:") {
+                    report.psnr_avg = v.parse::<f64>().ok();
+                }
+            }
+        }
+    }
+
+    if report.ssim_all.is_none() && report.psnr_avg.is_none() {
+        return Err(MediaError::ProbeFailed(
+            "FFmpeg did not emit SSIM/PSNR metrics for the selected files".into(),
+        ));
+    }
+    Ok(report)
+}
+
+/// Measured EBU R128 loudness & true-peak statistics for an audio stream.
+#[derive(Debug, Clone, Default)]
+pub struct AudioLoudnessReport {
+    pub integrated_lufs: f64,
+    pub true_peak_dbtp: f64,
+    pub lra_lu: f64,
+}
+
+/// Scans an audio stream with FFmpeg `loudnorm=print_format=json` to measure Integrated LUFS, True Peak, and LRA.
+pub fn measure_audio_loudness(
+    binaries: &FfmpegBinaries,
+    path: &Path,
+    audio_stream_index: usize,
+    start_pts: TimestampUs,
+    duration_secs: f64,
+) -> Result<AudioLoudnessReport, MediaError> {
+    let start_secs = start_pts.as_seconds_f64();
+    let mut cmd = Command::new(&binaries.ffmpeg_path);
+    configure_background_command(&mut cmd);
+    cmd.args(["-hide_banner", "-nostdin"]);
+    if start_secs > 0.001 {
+        cmd.arg("-ss").arg(format!("{start_secs:.6}"));
+    }
+    cmd.arg("-i").arg(path);
+    cmd.arg("-t").arg(format!("{:.3}", duration_secs.max(0.5)));
+    cmd.args([
+        "-map",
+        &format!("0:{audio_stream_index}"),
+        "-af",
+        "loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json",
+        "-vn",
+        "-sn",
+        "-f",
+        "null",
+        "-",
+    ]);
+
+    let out = cmd.output()?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let parse_json_num = |key: &str| -> Option<f64> {
+        for line in stderr.lines() {
+            if let Some(pos) = line.find(key) {
+                let rest = &line[pos + key.len()..];
+                if let Some(colon) = rest.find(':') {
+                    let val = rest[colon + 1..]
+                        .trim()
+                        .trim_end_matches(',')
+                        .trim_matches('"');
+                    if let Ok(num) = val.parse::<f64>() {
+                        return Some(num);
+                    }
+                }
+            }
+        }
+        None
+    };
+
+    let integrated_lufs = parse_json_num("\"input_i\"").ok_or_else(|| {
+        MediaError::ProbeFailed("Could not parse loudnorm LUFS output from FFmpeg".into())
+    })?;
+    let true_peak_dbtp = parse_json_num("\"input_tp\"").unwrap_or(0.0);
+    let lra_lu = parse_json_num("\"input_lra\"").unwrap_or(0.0);
+
+    Ok(AudioLoudnessReport {
+        integrated_lufs,
+        true_peak_dbtp,
+        lra_lu,
+    })
+}
+
 /// Decoded RGBA8 video frame ready for preview caching or display.
 #[derive(Debug, Clone)]
 pub struct DecodedFrame {

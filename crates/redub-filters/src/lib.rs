@@ -1267,6 +1267,32 @@ impl FilterKind {
             }
         }
     }
+
+    /// Returns `true` when this filter can be gated per virtual frame via `enable='...'`
+    /// without altering video dimensions, frame count, or stream topology.
+    pub fn supports_frame_range(&self) -> bool {
+        match self {
+            Self::Crop { .. }
+            | Self::Resize { .. }
+            | Self::TwoToOneReduction { .. }
+            | Self::TemporalSpeed { .. }
+            | Self::SubtitleBurnIn { .. }
+            | Self::Deshake { .. } => false,
+            Self::Rotate {
+                angle: RotationAngle::Rotate90Cw | RotationAngle::Rotate270Cw,
+                ..
+            } => false,
+            Self::BorderFill {
+                expand_canvas: true,
+                ..
+            } => false,
+            Self::Deinterlace {
+                mode: DeinterlaceMode::SendField,
+                ..
+            } => false,
+            _ => true,
+        }
+    }
 }
 
 fn escape_ffmpeg_filter_path(path: &str) -> String {
@@ -1285,7 +1311,54 @@ pub struct FilterInstance {
     pub enabled: bool,
     #[serde(default = "default_true")]
     pub is_open: bool,
+    /// Optional inclusive start virtual frame (`None` = from start of timeline).
+    #[serde(default)]
+    pub start_frame: Option<u64>,
+    /// Optional inclusive end virtual frame (`None` = through end of timeline).
+    #[serde(default)]
+    pub end_frame: Option<u64>,
     pub kind: FilterKind,
+}
+
+impl FilterInstance {
+    /// Returns `(start, end)` ordered so `start <= end` when both bounds exist.
+    pub fn normalized_range(&self) -> (Option<u64>, Option<u64>) {
+        match (self.start_frame, self.end_frame) {
+            (Some(s), Some(e)) if s > e => (Some(e), Some(s)),
+            other => other,
+        }
+    }
+
+    /// Returns `true` when this filter supports per-frame ranges and has a bounded range set.
+    pub fn has_frame_range(&self) -> bool {
+        self.kind.supports_frame_range()
+            && (self.start_frame.is_some() || self.end_frame.is_some())
+    }
+
+    /// Returns `true` when this filter is enabled and applies at `virtual_frame`.
+    pub fn is_active_at_frame(&self, virtual_frame: u64) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        if !self.kind.supports_frame_range() {
+            return true;
+        }
+        let (s, e) = self.normalized_range();
+        s.map_or(true, |lo| virtual_frame >= lo) && e.map_or(true, |hi| virtual_frame <= hi)
+    }
+
+    /// Formats a compact badge string describing the configured active frame range, if any.
+    pub fn range_badge(&self) -> Option<String> {
+        if !self.has_frame_range() {
+            return None;
+        }
+        match self.normalized_range() {
+            (Some(s), Some(e)) => Some(format!("F:{s}..{e}")),
+            (Some(s), None) => Some(format!("F:{s}..")),
+            (None, Some(e)) => Some(format!("F:..{e}")),
+            (None, None) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1313,6 +1386,8 @@ impl FilterPipeline {
             id,
             enabled: true,
             is_open: true,
+            start_frame: None,
+            end_frame: None,
             kind,
         });
         id
@@ -1355,8 +1430,21 @@ impl FilterPipeline {
         (cur_w, cur_h)
     }
 
-    /// Computes the FFmpeg `-vf` filtergraph string and the final output dimensions.
+    /// Computes the FFmpeg `-vf` filtergraph string and the final output dimensions for a full clip
+    /// starting at virtual frame 0.
     pub fn to_ffmpeg_filtergraph(&self, source_w: u32, source_h: u32) -> (Option<String>, u32, u32) {
+        self.to_ffmpeg_filtergraph_for_range(source_w, source_h, None)
+    }
+
+    /// Computes the FFmpeg `-vf` filtergraph string for an exported half-open virtual frame range
+    /// `segment_virtual_range = Some((seg_v_start, seg_v_end))` (translating filter `start_frame`/`end_frame`
+    /// bounds into 0-based segment frame indices `n` via `enable='between(n,...)'`), or `None` for `[0, inf)`.
+    pub fn to_ffmpeg_filtergraph_for_range(
+        &self,
+        source_w: u32,
+        source_h: u32,
+        segment_virtual_range: Option<(u64, u64)>,
+    ) -> (Option<String>, u32, u32) {
         let mut cur_w = source_w;
         let mut cur_h = source_h;
         let mut exprs = Vec::new();
@@ -1365,11 +1453,56 @@ impl FilterPipeline {
             if !instance.enabled {
                 continue;
             }
+
+            let enable_cond = if !instance.has_frame_range() {
+                None
+            } else {
+                let (opt_s, opt_e) = instance.normalized_range();
+                match segment_virtual_range {
+                    None => match (opt_s, opt_e) {
+                        (Some(s), Some(e)) => Some(format!("between(n,{s},{e})")),
+                        (Some(s), None) => Some(format!("gte(n,{s})")),
+                        (None, Some(e)) => Some(format!("lte(n,{e})")),
+                        (None, None) => None,
+                    },
+                    Some((seg_v_start, seg_v_end)) => {
+                        if seg_v_end <= seg_v_start {
+                            continue;
+                        }
+                        let seg_last = seg_v_end - 1;
+                        let eff_s = opt_s.unwrap_or(0);
+                        let eff_e = opt_e.unwrap_or(u64::MAX);
+                        if eff_e < seg_v_start || eff_s > seg_last {
+                            // Segment does not overlap this filter's active frame window
+                            continue;
+                        }
+                        if eff_s <= seg_v_start && eff_e >= seg_last {
+                            // Covers the entire exported segment -> no runtime `enable` check needed
+                            None
+                        } else {
+                            let local_s = eff_s.saturating_sub(seg_v_start);
+                            let local_e = eff_e.min(seg_last) - seg_v_start;
+                            let seg_local_last = seg_last - seg_v_start;
+                            if local_s == 0 && local_e < seg_local_last {
+                                Some(format!("lte(n,{local_e})"))
+                            } else if local_s > 0 && local_e >= seg_local_last {
+                                Some(format!("gte(n,{local_s})"))
+                            } else {
+                                Some(format!("between(n,{local_s},{local_e})"))
+                            }
+                        }
+                    }
+                }
+            };
+
             if let Some((mut expr, next_w, next_h)) = instance.kind.to_ffmpeg_expr(cur_w, cur_h) {
                 if expr.contains("cutdub_base") {
                     expr = expr
                         .replace("cutdub_base", &format!("cutdub_base_{}", instance.id))
                         .replace("cutdub_logo", &format!("cutdub_logo_{}", instance.id));
+                }
+                if let Some(en) = enable_cond {
+                    expr = apply_enable_to_expr(&instance.kind, expr, &en);
                 }
                 exprs.push(expr);
                 cur_w = next_w;
@@ -1385,16 +1518,33 @@ impl FilterPipeline {
     }
 
     /// Applies all enabled filters in-memory to an RGBA8 buffer `(width, height, rgba_bytes)`
-    /// for real-time interactive Output preview.
+    /// for real-time interactive Output preview across all frames.
     pub fn apply_to_rgba(
+        &self,
+        width: u32,
+        height: u32,
+        pixels: Vec<u8>,
+    ) -> (u32, u32, Vec<u8>) {
+        self.apply_to_rgba_at_frame(width, height, pixels, None)
+    }
+
+    /// Applies all enabled filters in-memory that are active at `virtual_frame` (or all enabled
+    /// filters if `virtual_frame` is `None`).
+    pub fn apply_to_rgba_at_frame(
         &self,
         mut width: u32,
         mut height: u32,
         mut pixels: Vec<u8>,
+        virtual_frame: Option<u64>,
     ) -> (u32, u32, Vec<u8>) {
         for instance in &self.filters {
             if !instance.enabled {
                 continue;
+            }
+            if let Some(vf) = virtual_frame {
+                if !instance.is_active_at_frame(vf) {
+                    continue;
+                }
             }
             match &instance.kind {
                 FilterKind::Crop {
@@ -2471,7 +2621,7 @@ fn draw_bitmap_banner(
     }
 }
 
-/// 64-bin normalized RGB and BT.709 Luma histogram + black/white clipping metrics for video scopes.
+/// 64-bin normalized RGB and BT.709 Luma histogram + Luma Waveform (64x32) + UV Vectorscope (48x48).
 #[derive(Debug, Clone)]
 pub struct FrameHistogram {
     pub r_bins: [f32; 64],
@@ -2481,6 +2631,10 @@ pub struct FrameHistogram {
     pub shadow_clip_pct: f32,
     pub highlight_clip_pct: f32,
     pub mean_luma: f32,
+    /// 64 columns × 32 luma rows (row 0 = 0% black, row 31 = 100% white), scaled 0..=255.
+    pub luma_waveform: Vec<u8>,
+    /// 48×48 Cb/Cr vectorscope density grid, scaled 0..=255.
+    pub vectorscope: Vec<u8>,
 }
 
 impl Default for FrameHistogram {
@@ -2493,12 +2647,19 @@ impl Default for FrameHistogram {
             shadow_clip_pct: 0.0,
             highlight_clip_pct: 0.0,
             mean_luma: 0.0,
+            luma_waveform: Vec::new(),
+            vectorscope: Vec::new(),
         }
     }
 }
 
-/// Computes a fast 64-bin RGB + Luma histogram from an RGBA8 frame buffer (subsampling large frames for 0ms UI cost).
+/// Computes a fast 64-bin RGB + Luma histogram from an RGBA8 frame buffer.
 pub fn compute_rgba_histogram(rgba: &[u8]) -> FrameHistogram {
+    compute_rgba_scopes(rgba, 0, 0)
+}
+
+/// Computes RGB/Luma Histogram, 64×32 Luma Waveform Monitor, and 48×48 UV Vectorscope from RGBA8.
+pub fn compute_rgba_scopes(rgba: &[u8], width: u32, _height: u32) -> FrameHistogram {
     let total_pixels = rgba.len() / 4;
     if total_pixels == 0 {
         return FrameHistogram::default();
@@ -2509,6 +2670,8 @@ pub fn compute_rgba_histogram(rgba: &[u8]) -> FrameHistogram {
     let mut g_counts = [0u32; 64];
     let mut b_counts = [0u32; 64];
     let mut y_counts = [0u32; 64];
+    let mut wf_counts = if width > 0 { vec![0u32; 64 * 32] } else { Vec::new() };
+    let mut vs_counts = vec![0u32; 48 * 48];
     let mut shadows = 0u32;
     let mut highlights = 0u32;
     let mut sum_y = 0u64;
@@ -2526,6 +2689,19 @@ pub fn compute_rgba_histogram(rgba: &[u8]) -> FrameHistogram {
         g_counts[(g >> 2) as usize] += 1;
         b_counts[(b >> 2) as usize] += 1;
         y_counts[(y >> 2) as usize] += 1;
+
+        if width > 0 {
+            let px = (px_idx as u32) % width;
+            let wf_col = ((px * 64) / width).min(63) as usize;
+            let wf_row = ((y * 32) / 256).min(31) as usize;
+            wf_counts[wf_row * 64 + wf_col] += 1;
+        }
+
+        let cb = (((-38 * r as i32 - 74 * g as i32 + 112 * b as i32 + 128) >> 8) + 128).clamp(0, 255) as usize;
+        let cr = (((112 * r as i32 - 94 * g as i32 - 18 * b as i32 + 128) >> 8) + 128).clamp(0, 255) as usize;
+        let vx = ((cb * 48) / 256).min(47);
+        let vy = 47 - ((cr * 48) / 256).min(47);
+        vs_counts[vy * 48 + vx] += 1;
 
         if y <= 2 {
             shadows += 1;
@@ -2550,6 +2726,31 @@ pub fn compute_rgba_histogram(rgba: &[u8]) -> FrameHistogram {
         hist.b_bins[i] = (b_counts[i] as f32 / max_bin).clamp(0.0, 1.0);
         hist.luma_bins[i] = (y_counts[i] as f32 / max_bin).clamp(0.0, 1.0);
     }
+
+    if !wf_counts.is_empty() {
+        let wf_max = (*wf_counts.iter().max().unwrap_or(&1)).max(1) as f32;
+        hist.luma_waveform = wf_counts
+            .into_iter()
+            .map(|c| {
+                if c == 0 {
+                    0
+                } else {
+                    (((c as f32 / wf_max).sqrt() * 255.0).round() as u8).max(24)
+                }
+            })
+            .collect();
+    }
+    let vs_max = (*vs_counts.iter().max().unwrap_or(&1)).max(1) as f32;
+    hist.vectorscope = vs_counts
+        .into_iter()
+        .map(|c| {
+            if c == 0 {
+                0
+            } else {
+                (((c as f32 / vs_max).sqrt() * 255.0).round() as u8).max(24)
+            }
+        })
+        .collect();
 
     let denom = sampled.max(1) as f32;
     hist.shadow_clip_pct = (shadows as f32 / denom) * 100.0;
@@ -2733,4 +2934,135 @@ mod tests {
         let center = (15 * 32 + 15) * 4;
         assert_eq!(out[center], 200);
     }
+
+    #[test]
+    fn test_per_filter_active_frame_range() {
+        assert!(!FilterKind::Crop {
+            left: 2,
+            top: 2,
+            right: 2,
+            bottom: 2
+        }
+        .supports_frame_range());
+        assert!(FilterKind::Blur {
+            sigma: 2.0,
+            steps: 1
+        }
+        .supports_frame_range());
+
+        let mut pipe = FilterPipeline::new();
+        let inv_id = pipe.add(FilterKind::Invert {
+            invert_r: true,
+            invert_g: true,
+            invert_b: true,
+        });
+        pipe.filters[0].start_frame = Some(10);
+        pipe.filters[0].end_frame = Some(20);
+        assert_eq!(pipe.filters[0].id, inv_id);
+        assert_eq!(pipe.filters[0].range_badge().as_deref(), Some("F:10..20"));
+        assert!(!pipe.filters[0].is_active_at_frame(9));
+        assert!(pipe.filters[0].is_active_at_frame(10));
+        assert!(pipe.filters[0].is_active_at_frame(20));
+        assert!(!pipe.filters[0].is_active_at_frame(21));
+
+        pipe.add(FilterKind::Threshold { level: 128 });
+        pipe.filters[1].start_frame = Some(15);
+        pipe.filters[1].end_frame = Some(30);
+
+        pipe.add(FilterKind::TextOverlay {
+            text: "Hello, world".into(),
+            show_timecode: false,
+            show_frame_number: false,
+            position: OverlayPosition::BottomLeft,
+            font_size: 24,
+            box_opacity: 0.5,
+        });
+        pipe.filters[2].start_frame = Some(12);
+        pipe.filters[2].end_frame = Some(18);
+
+        // Full timeline graph uses virtual frames directly
+        let (fg_full, _, _) = pipe.to_ffmpeg_filtergraph(640, 360);
+        let fg_full = fg_full.unwrap();
+        assert!(fg_full.contains("negate=enable='between(n,10,20)'"));
+        assert!(fg_full.contains("lutyuv=y='if(gte(val\\,128)\\,255\\,0)':u=128:v=128:enable='between(n,15,30)'"));
+        assert!(fg_full.contains("drawtext=text='Hello, world'"));
+        assert!(fg_full.contains(":enable='between(n,12,18)'"));
+
+        // Exported selection [8, 25): Invert => between(n,2,12), Threshold => gte(n,7), TextOverlay => between(n,4,10)
+        let (fg_sel, _, _) = pipe.to_ffmpeg_filtergraph_for_range(640, 360, Some((8, 25)));
+        let fg_sel = fg_sel.unwrap();
+        assert!(fg_sel.contains("negate=enable='between(n,2,12)'"));
+        assert!(fg_sel.contains(":enable='gte(n,7)'"));
+        assert!(fg_sel.contains(":enable='between(n,4,10)'"));
+
+        // Exported selection [35, 50): zero overlap -> None
+        let (fg_none, _, _) = pipe.to_ffmpeg_filtergraph_for_range(640, 360, Some((35, 50)));
+        assert!(fg_none.is_none());
+
+        // Exported selection [10, 15): Invert covers full segment -> plain `negate` without `enable=`
+        let (fg_cov, _, _) = pipe.to_ffmpeg_filtergraph_for_range(640, 360, Some((10, 15)));
+        let fg_cov = fg_cov.unwrap();
+        assert!(fg_cov.contains("negate"));
+        assert!(!fg_cov.contains("negate=enable="));
+
+        // Preview gating in apply_to_rgba_at_frame
+        let px = vec![40u8, 40, 40, 255];
+        let (_, _, out_outside) = pipe.apply_to_rgba_at_frame(1, 1, px.clone(), Some(5));
+        assert_eq!(out_outside[0], 40);
+        let (_, _, out_inside) = pipe.apply_to_rgba_at_frame(1, 1, px, Some(11));
+        assert_eq!(out_inside[0], 215);
+
+        // Legacy JSON without start_frame/end_frame deserializes cleanly
+        let legacy = r#"{"id":1,"enabled":true,"kind":"Grayscale"}"#;
+        let inst: FilterInstance = serde_json::from_str(legacy).unwrap();
+        assert_eq!(inst.start_frame, None);
+        assert_eq!(inst.end_frame, None);
+        assert!(!inst.has_frame_range());
+    }
+}
+
+fn split_top_level_commas(expr: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut in_quotes = false;
+    let mut escaped = false;
+    let mut start = 0usize;
+    for (idx, ch) in expr.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '\'' => in_quotes = !in_quotes,
+            ',' if !in_quotes => {
+                parts.push(&expr[start..idx]);
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&expr[start..]);
+    parts
+}
+
+fn apply_enable_to_expr(kind: &FilterKind, expr: String, enable_expr: &str) -> String {
+    if let FilterKind::Threshold { level } = kind {
+        return format!(
+            "lutyuv=y='if(gte(val\\,{level})\\,255\\,0)':u=128:v=128:enable='{enable_expr}'"
+        );
+    }
+    if matches!(kind, FilterKind::LogoOverlay { .. }) {
+        return format!("{expr}:enable='{enable_expr}'");
+    }
+    split_top_level_commas(&expr)
+        .into_iter()
+        .map(|part| {
+            if part.contains('=') {
+                format!("{part}:enable='{enable_expr}'")
+            } else {
+                format!("{part}=enable='{enable_expr}'")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }

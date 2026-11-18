@@ -669,6 +669,12 @@ pub struct ExportSettings {
     pub audio_volume_db: f32,
     #[serde(default)]
     pub audio_normalize_loudness: bool,
+    #[serde(default)]
+    pub audio_highpass_hz: Option<u32>,
+    #[serde(default)]
+    pub audio_denoise_afftdn: bool,
+    #[serde(default)]
+    pub audio_compressor: bool,
 }
 
 impl Default for ExportSettings {
@@ -697,7 +703,42 @@ impl Default for ExportSettings {
             audio_channels: AudioChannelMode::Original,
             audio_volume_db: 0.0,
             audio_normalize_loudness: false,
+            audio_highpass_hz: None,
+            audio_denoise_afftdn: false,
+            audio_compressor: false,
         }
+    }
+}
+
+/// Complete serializable CutDub workspace (timeline project + filter pipeline + export settings).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CutDubWorkspace {
+    pub version: u32,
+    pub project: Project,
+    pub filters: FilterPipeline,
+    pub export_settings: ExportSettings,
+}
+
+impl CutDubWorkspace {
+    pub fn save_to_file(&self, path: &Path) -> Result<(), ExportError> {
+        let json = serde_json::to_string_pretty(self).map_err(|e| ExportError::Io(std::io::Error::other(e)))?;
+        fs::write(path, json)?;
+        Ok(())
+    }
+
+    pub fn load_from_file(path: &Path) -> Result<Self, ExportError> {
+        let data = fs::read(path)?;
+        if let Ok(ws) = serde_json::from_slice::<Self>(&data) {
+            return Ok(ws);
+        }
+        let proj = Project::load_from_file(path)
+            .map_err(|e| ExportError::Io(std::io::Error::other(e.to_string())))?;
+        Ok(Self {
+            version: 1,
+            project: proj,
+            filters: FilterPipeline::new(),
+            export_settings: ExportSettings::default(),
+        })
     }
 }
 
@@ -1123,6 +1164,12 @@ pub fn start_export_job(
     let cancel_clone = Arc::clone(&cancel_flag);
     let out_clone = output_path.clone();
 
+    let start_vf = if settings.export_selection_only {
+        project.selection_range().map(|(s, _)| s).unwrap_or(0)
+    } else {
+        0
+    };
+
     thread::Builder::new()
         .name("cutdub-export-worker".into())
         .spawn(move || {
@@ -1133,6 +1180,7 @@ pub fn start_export_job(
                 &filters,
                 &settings,
                 &out_clone,
+                start_vf,
                 &cancel_clone,
                 &tx,
             );
@@ -1365,6 +1413,7 @@ pub fn start_split_by_markers_export_job(
                     &filters,
                     &settings,
                     &clip_path,
+                    *s_frame,
                     &cancel_clone,
                     &tx,
                 ) {
@@ -1479,8 +1528,18 @@ pub fn start_animated_gif_or_webp_export_job(
 
             let speed = filters.effective_speed_factor();
             let total_duration = TimestampUs(((total_dur_us as f64) / speed).round() as i64);
+            let start_vf = if export_selection_only {
+                project.selection_range().map(|(s, _)| s).unwrap_or(0)
+            } else {
+                0
+            };
+            let total_v_frames: u64 = segs.iter().map(|s| s.frame_count()).sum();
             let base_vf = filters
-                .to_ffmpeg_filtergraph(first_src.width, first_src.height)
+                .to_ffmpeg_filtergraph_for_range(
+                    first_src.width,
+                    first_src.height,
+                    Some((start_vf, start_vf + total_v_frames)),
+                )
                 .0;
             let fps_c = fps.clamp(1, 50);
             let max_w = (max_width.clamp(64, 3840) & !1).max(64);
@@ -1653,8 +1712,18 @@ pub fn start_image_sequence_export_job(
 
             let speed = filters.effective_speed_factor();
             let total_duration = TimestampUs(((total_dur_us as f64) / speed).round() as i64);
+            let start_vf = if export_selection_only {
+                project.selection_range().map(|(s, _)| s).unwrap_or(0)
+            } else {
+                0
+            };
+            let total_v_frames: u64 = segs.iter().map(|s| s.frame_count()).sum();
             let base_vf = filters
-                .to_ffmpeg_filtergraph(first_src.width, first_src.height)
+                .to_ffmpeg_filtergraph_for_range(
+                    first_src.width,
+                    first_src.height,
+                    Some((start_vf, start_vf + total_v_frames)),
+                )
                 .0;
 
             if concat_inputs.len() == 1 {
@@ -1713,6 +1782,7 @@ fn execute_export(
     filters: &FilterPipeline,
     settings: &ExportSettings,
     output_path: &Path,
+    start_virtual_frame: u64,
     cancel_flag: &Arc<AtomicBool>,
     tx: &mpsc::Sender<ExportEvent>,
 ) -> Result<TimestampUs, ExportError> {
@@ -1733,12 +1803,15 @@ fn execute_export(
     let scaled_duration_us = ((total_duration_us as f64) / speed_factor).round() as i64;
     let total_duration = TimestampUs(scaled_duration_us.max(1));
 
-    // Expand segments into concrete (EditSegment, ExportSettings) tasks.
+    // Expand segments into concrete (EditSegment, ExportSettings, FilterPipeline, seg_v_start) tasks.
     // In SmartCopy mode, any segment starting on a non-keyframe is split into:
     //   1) [start_frame, next_keyframe) -> FullProcessing (re-encode partial lead-in GOP)
     //   2) [next_keyframe, end_frame)   -> DirectStreamCopy (lossless stream copy from keyframe)
-    let mut sub_tasks: Vec<(EditSegment, ExportSettings, FilterPipeline)> = Vec::new();
+    let mut sub_tasks: Vec<(EditSegment, ExportSettings, FilterPipeline, u64)> = Vec::new();
+    let mut cur_vf = start_virtual_frame;
     for seg in segments {
+        let seg_v_start = cur_vf;
+        cur_vf += seg.frame_count();
         if settings.processing_mode == VideoProcessingMode::SmartCopy {
             if let Some(src) = project.source_by_id(seg.source_id) {
                 let kf_before = src.timing.keyframe_at_or_before(seg.start_frame);
@@ -1746,7 +1819,7 @@ fn execute_export(
                     let mut copy_set = settings.clone();
                     copy_set.processing_mode = VideoProcessingMode::DirectStreamCopy;
                     copy_set.keyframe_policy = KeyframeCutPolicy::ExactTimestamp;
-                    sub_tasks.push((*seg, copy_set, FilterPipeline::new()));
+                    sub_tasks.push((*seg, copy_set, FilterPipeline::new(), seg_v_start));
                     continue;
                 }
                 let next_kf = src.timing.next_keyframe(seg.start_frame).min(seg.end_frame);
@@ -1765,6 +1838,7 @@ fn execute_export(
                         },
                         gop_set,
                         FilterPipeline::new(),
+                        seg_v_start,
                     ));
                 }
                 if next_kf < seg.end_frame {
@@ -1779,16 +1853,17 @@ fn execute_export(
                         },
                         copy_set,
                         FilterPipeline::new(),
+                        seg_v_start + (next_kf - seg.start_frame),
                     ));
                 }
                 continue;
             }
         }
-        sub_tasks.push((*seg, settings.clone(), filters.clone()));
+        sub_tasks.push((*seg, settings.clone(), filters.clone(), seg_v_start));
     }
 
     if sub_tasks.len() == 1 {
-        let (ref seg, ref task_settings, ref task_filters) = sub_tasks[0];
+        let (ref seg, ref task_settings, ref task_filters, seg_v_start) = sub_tasks[0];
         execute_single_segment_task(
             binaries,
             project,
@@ -1796,6 +1871,7 @@ fn execute_export(
             task_filters,
             task_settings,
             output_path,
+            Some((seg_v_start, seg_v_start + seg.frame_count())),
             total_duration,
             TimestampUs::ZERO,
             cancel_flag,
@@ -1807,7 +1883,7 @@ fn execute_export(
         let mut part_paths = Vec::with_capacity(sub_tasks.len());
         let mut completed_us = 0i64;
 
-        for (idx, (seg, task_settings, task_filters)) in sub_tasks.iter().enumerate() {
+        for (idx, (seg, task_settings, task_filters, seg_v_start)) in sub_tasks.iter().enumerate() {
             if cancel_flag.load(Ordering::SeqCst) {
                 return Err(ExportError::Cancelled);
             }
@@ -1821,6 +1897,7 @@ fn execute_export(
                 task_filters,
                 task_settings,
                 &part_path,
+                Some((*seg_v_start, *seg_v_start + seg.frame_count())),
                 total_duration,
                 TimestampUs(completed_us),
                 cancel_flag,
@@ -1873,6 +1950,7 @@ fn execute_export(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_single_segment_command(
     binaries: &FfmpegBinaries,
     project: &Project,
@@ -1880,6 +1958,7 @@ fn build_single_segment_command(
     filters: &FilterPipeline,
     settings: &ExportSettings,
     output_path: &Path,
+    seg_virtual_range: Option<(u64, u64)>,
 ) -> Result<Command, ExportError> {
     build_single_segment_command_with_pass(
         binaries,
@@ -1888,10 +1967,12 @@ fn build_single_segment_command(
         filters,
         settings,
         output_path,
+        seg_virtual_range,
         None,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_single_segment_command_with_pass(
     binaries: &FfmpegBinaries,
     project: &Project,
@@ -1899,6 +1980,7 @@ fn build_single_segment_command_with_pass(
     filters: &FilterPipeline,
     settings: &ExportSettings,
     output_path: &Path,
+    seg_virtual_range: Option<(u64, u64)>,
     two_pass: Option<(u8, &str)>,
 ) -> Result<Command, ExportError> {
     let src = project
@@ -1981,7 +2063,8 @@ fn build_single_segment_command_with_pass(
             cmd.args(["-map", &format!("0:{}", src.video_stream_index)]);
 
             // Construct video filtergraph from FilterPipeline + optional custom export resolution
-            let (mut vf_chain, out_w, out_h) = filters.to_ffmpeg_filtergraph(src.width, src.height);
+            let (mut vf_chain, out_w, out_h) =
+                filters.to_ffmpeg_filtergraph_for_range(src.width, src.height, seg_virtual_range);
             if let Some((req_w, req_h)) = settings.custom_resolution {
                 let w = req_w.max(2) & !1;
                 let h = req_h.max(2) & !1;
@@ -2329,8 +2412,11 @@ fn append_audio_and_subtitle_args(
             1.0
         };
         let has_speed_change = (speed_factor - 1.0).abs() > 0.005;
-        let has_global_audio_filter =
-            settings.audio_volume_db.abs() > 0.05 || settings.audio_normalize_loudness;
+        let has_global_audio_filter = settings.audio_volume_db.abs() > 0.05
+            || settings.audio_normalize_loudness
+            || settings.audio_highpass_hz.is_some()
+            || settings.audio_denoise_afftdn
+            || settings.audio_compressor;
         let has_resample_or_remix = settings.audio_sample_rate.is_some()
             || settings.audio_channels.channel_count().is_some();
 
@@ -2445,6 +2531,16 @@ fn append_audio_and_subtitle_args(
         }
 
         if out_audio_idx > 0 {
+            if let Some(hp_hz) = settings.audio_highpass_hz {
+                audio_filter_parts.push(format!("highpass=f={}", hp_hz.clamp(20, 500)));
+            }
+            if settings.audio_denoise_afftdn {
+                audio_filter_parts.push("afftdn=nf=-25".to_string());
+            }
+            if settings.audio_compressor {
+                audio_filter_parts
+                    .push("acompressor=threshold=-18dB:ratio=3:attack=10:release=120".to_string());
+            }
             if settings.audio_volume_db.abs() > 0.05 {
                 audio_filter_parts.push(format!("volume={:.1}dB", settings.audio_volume_db));
             }
@@ -2576,6 +2672,7 @@ fn execute_single_segment_task(
     filters: &FilterPipeline,
     settings: &ExportSettings,
     output_path: &Path,
+    seg_virtual_range: Option<(u64, u64)>,
     total_duration: TimestampUs,
     base_completed: TimestampUs,
     cancel_flag: &Arc<AtomicBool>,
@@ -2598,6 +2695,7 @@ fn execute_single_segment_task(
                 filters,
                 settings,
                 output_path,
+                seg_virtual_range,
                 total_duration,
                 base_completed,
                 cancel_flag,
@@ -2624,6 +2722,7 @@ fn execute_single_segment_task(
             filters,
             settings,
             output_path,
+            seg_virtual_range,
             Some((1, &pass_prefix)),
         )?;
         run_ffmpeg_with_progress(cmd_pass1, total_duration, base_completed, cancel_flag, tx)?;
@@ -2635,6 +2734,7 @@ fn execute_single_segment_task(
             filters,
             settings,
             output_path,
+            seg_virtual_range,
             Some((2, &pass_prefix)),
         )?;
         return run_ffmpeg_with_progress(
@@ -2653,6 +2753,7 @@ fn execute_single_segment_task(
         filters,
         settings,
         output_path,
+        seg_virtual_range,
     )?;
     run_ffmpeg_with_progress(cmd, total_duration, base_completed, cancel_flag, tx)
 }
@@ -2673,6 +2774,7 @@ fn run_external_vvenc_segment_export(
     filters: &FilterPipeline,
     settings: &ExportSettings,
     output_path: &Path,
+    seg_virtual_range: Option<(u64, u64)>,
     total_duration: TimestampUs,
     base_completed: TimestampUs,
     cancel_flag: &Arc<AtomicBool>,
@@ -2686,7 +2788,8 @@ fn run_external_vvenc_segment_export(
     let end_pts = src.timing.frame_to_timestamp(seg.end_frame);
     let duration_secs = ((end_pts.0 - start_pts.0).max(1_000)) as f64 / 1_000_000.0;
 
-    let (mut vf_chain, out_w, out_h) = filters.to_ffmpeg_filtergraph(src.width, src.height);
+    let (mut vf_chain, out_w, out_h) =
+        filters.to_ffmpeg_filtergraph_for_range(src.width, src.height, seg_virtual_range);
     let (mut final_w, mut final_h) = (out_w, out_h);
     if let Some((req_w, req_h)) = settings.custom_resolution {
         let w = req_w.max(2) & !1;
@@ -3176,6 +3279,7 @@ pub fn start_batch_queue(
                         &filt_clone,
                         &set_clone,
                         &out_path,
+                        0,
                         &flag_inner,
                         &inner_tx,
                     )
@@ -3387,6 +3491,7 @@ pub fn execute_automation_script(
         &script.filters,
         &settings,
         &script.output_path,
+        0,
         &cancel,
         &tx,
     )
@@ -3837,5 +3942,66 @@ mod tests {
         }
         assert!(ok_seq);
         assert!(seq_dir.join("testframe_00001.png").is_file());
+    }
+
+    #[test]
+    fn test_ranged_filters_full_and_selection_export() {
+        let bins = FfmpegBinaries::discover(None, None).expect("FFmpeg must be installed");
+        let tmp = TempDir::new().unwrap();
+        let src_path = tmp.path().join("src_ranged.mp4");
+        generate_synthetic_video(&bins, &src_path, 160, 120, 20, 1.5, 5).unwrap();
+        let clip = probe_media_file(&bins, &src_path, true).unwrap();
+        let mut project = Project::from_primary_source(clip);
+
+        // Invert active on frames 5..=15, Threshold active on frames 12..=20
+        let mut filters = FilterPipeline::new();
+        filters.add(FilterKind::Invert {
+            invert_r: true,
+            invert_g: true,
+            invert_b: true,
+        });
+        filters.filters[0].start_frame = Some(5);
+        filters.filters[0].end_frame = Some(15);
+        filters.add(FilterKind::Threshold { level: 128 });
+        filters.filters[1].start_frame = Some(12);
+        filters.filters[1].end_frame = Some(20);
+
+        project.current_frame = 4;
+        project.set_mark_in();
+        project.current_frame = 24;
+        project.set_mark_out();
+
+        let sel_out = tmp.path().join("ranged_selection.mp4");
+        let settings = ExportSettings {
+            processing_mode: VideoProcessingMode::FullProcessing,
+            export_selection_only: true,
+            container: ContainerFormat::Mp4,
+            video_encoder: "libx264".into(),
+            crf: 22,
+            encoder_preset: "ultrafast".into(),
+            ..ExportSettings::default()
+        };
+        let handle = start_export_job(
+            bins.clone(),
+            project,
+            filters,
+            settings,
+            sel_out.clone(),
+        )
+        .unwrap();
+        let mut ok = false;
+        while let Ok(ev) = handle.receiver.recv() {
+            match ev {
+                ExportEvent::Completed { .. } => {
+                    ok = true;
+                    break;
+                }
+                ExportEvent::Failed(e) => panic!("Ranged filter export failed: {e}"),
+                _ => {}
+            }
+        }
+        assert!(ok);
+        let probed = probe_media_file(&bins, &sel_out, true).unwrap();
+        assert!(probed.timing.total_frames() >= 18);
     }
 }
