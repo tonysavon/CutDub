@@ -5218,12 +5218,23 @@ impl CutDubApp {
                                     1.0..=500.0,
                                 )
                                 .logarithmic(true)
+                                .clamping(egui::SliderClamping::Never)
                                 .suffix(" MB")
                                 .text("Target Size"),
                             );
+                            self.export_settings.target_file_size_mb =
+                                self.export_settings.target_file_size_mb.max(0.5);
                             ui.horizontal_wrapped(|ui| {
-                                for mb in [8.0f32, 10.0, 25.0, 50.0, 100.0, 250.0] {
-                                    if ui.small_button(format!("{mb:.0} MB")).clicked() {
+                                for (lbl, mb) in [
+                                    ("8 MB", 8.0f32),
+                                    ("25 MB", 25.0),
+                                    ("100 MB", 100.0),
+                                    ("250 MB", 250.0),
+                                    ("700 MB", 700.0),
+                                    ("1.5 GB", 1536.0),
+                                    ("4 GB", 4096.0),
+                                ] {
+                                    if ui.small_button(lbl).clicked() {
                                         self.export_settings.target_file_size_mb = mb;
                                     }
                                 }

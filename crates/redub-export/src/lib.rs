@@ -747,7 +747,7 @@ impl ExportSettings {
     pub fn supports_two_pass(&self) -> bool {
         matches!(
             self.video_encoder.as_str(),
-            "libx264" | "libx265" | "libvpx-vp9" | "libaom-av1"
+            "libx264" | "libx265" | "libsvtav1" | "libvpx-vp9" | "libaom-av1"
         ) && self.rate_control_mode != VideoRateControlMode::Crf
     }
     pub fn encoders_available(&self, caps: &MediaCapabilities) -> bool {
