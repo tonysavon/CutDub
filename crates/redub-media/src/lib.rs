@@ -50,6 +50,27 @@ pub struct MediaCapabilities {
     pub audio_encoders: Vec<EncoderInfo>,
     pub hwaccels: Vec<String>,
     pub encoder_names: HashSet<String>,
+    #[serde(default)]
+    pub has_vidstab: bool,
+}
+
+/// Checks whether the given FFmpeg binary was built with `filter_name` (e.g. `vidstabdetect`).
+pub fn ffmpeg_has_filter(ffmpeg_path: &Path, filter_name: &str) -> bool {
+    let mut cmd = Command::new(ffmpeg_path);
+    cmd.args(["-hide_banner", "-filters"]);
+    configure_background_command(&mut cmd);
+    let Ok(output) = cmd.output() else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout.lines().any(|line| {
+        line.split_whitespace()
+            .nth(1)
+            .is_some_and(|name| name == filter_name)
+    })
 }
 
 /// Curated priority order of video encoders (software and hardware across Apple VideoToolbox,
@@ -295,10 +316,14 @@ impl MediaCapabilities {
             });
         }
 
+        caps.has_vidstab = ffmpeg_has_filter(&binaries.ffmpeg_path, "vidstabdetect")
+            && ffmpeg_has_filter(&binaries.ffmpeg_path, "vidstabtransform");
+
         info!(
             video_encoders = caps.video_encoders.len(),
             audio_encoders = caps.audio_encoders.len(),
             hwaccels = ?caps.hwaccels,
+            has_vidstab = caps.has_vidstab,
             "Detected FFmpeg capabilities"
         );
         caps

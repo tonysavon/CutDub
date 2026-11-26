@@ -476,6 +476,14 @@ pub enum FilterKind {
         edge_mirror: bool,
         blocksize: u32,
     },
+    /// Two-Pass Pro Video Stabilizer (`vidstabdetect` + `vidstabtransform`, falls back to `deshake`).
+    Vidstab {
+        shakiness: u32,
+        accuracy: u32,
+        smoothing: u32,
+        zoom: f32,
+        tripod: bool,
+    },
 }
 
 impl FilterKind {
@@ -560,6 +568,7 @@ impl FilterKind {
             Self::LogoOverlay { .. } => "Logo / Image Watermark",
             Self::Lut3d { .. } => "3D LUT (.cube Color Grade)",
             Self::Deshake { .. } => "Stabilize (Deshake)",
+            Self::Vidstab { .. } => "Pro Stabilizer (VidStab 2-Pass)",
         }
     }
 
@@ -764,6 +773,19 @@ impl FilterKind {
                 rx,
                 ry,
                 if *edge_mirror { "Mirror" } else { "Clamp" }
+            ),
+            Self::Vidstab {
+                shakiness,
+                smoothing,
+                zoom,
+                tripod,
+                ..
+            } => format!(
+                "Shake:{} Smooth:{} Zoom:{:.0}%{}",
+                shakiness,
+                smoothing,
+                zoom,
+                if *tripod { " [Tripod]" } else { "" }
             ),
         }
     }
@@ -1265,6 +1287,15 @@ impl FilterKind {
                     current_h,
                 ))
             }
+            Self::Vidstab { shakiness, .. } => {
+                // Single-pass fallback when FFmpeg lacks `--enable-libvidstab`
+                let r = (*shakiness * 3).clamp(8, 64);
+                Some((
+                    format!("deshake=rx={r}:ry={r}:edge=mirror:blocksize=8"),
+                    current_w,
+                    current_h,
+                ))
+            }
         }
     }
 
@@ -1277,7 +1308,8 @@ impl FilterKind {
             | Self::TwoToOneReduction { .. }
             | Self::TemporalSpeed { .. }
             | Self::SubtitleBurnIn { .. }
-            | Self::Deshake { .. } => false,
+            | Self::Deshake { .. }
+            | Self::Vidstab { .. } => false,
             Self::Rotate {
                 angle: RotationAngle::Rotate90Cw | RotationAngle::Rotate270Cw,
                 ..
@@ -1515,6 +1547,85 @@ impl FilterPipeline {
         } else {
             (Some(exprs.join(",")), cur_w, cur_h)
         }
+    }
+
+    /// Returns `true` if any enabled filter in this pipeline is a two-pass `Vidstab` stabilizer.
+    pub fn has_vidstab(&self) -> bool {
+        self.filters
+            .iter()
+            .any(|f| f.enabled && matches!(f.kind, FilterKind::Vidstab { .. }))
+    }
+
+    /// Builds `(pass1_detect_vf, pass2_transform_vf, out_w, out_h)` for two-pass `vidstab`
+    /// stabilization writing/reading motion vectors at `trf_path`.
+    pub fn to_ffmpeg_vidstab_filtergraphs(
+        &self,
+        source_w: u32,
+        source_h: u32,
+        segment_virtual_range: Option<(u64, u64)>,
+        trf_path: &std::path::Path,
+    ) -> (Option<String>, Option<String>, u32, u32) {
+        let escaped_trf = escape_ffmpeg_filter_path(&trf_path.to_string_lossy());
+        let mut cur_w = source_w;
+        let mut cur_h = source_h;
+        let mut pass1_exprs = Vec::new();
+        let mut pass2_exprs = Vec::new();
+        let mut found_vidstab = false;
+
+        for instance in &self.filters {
+            if !instance.enabled {
+                continue;
+            }
+            if let FilterKind::Vidstab {
+                shakiness,
+                accuracy,
+                smoothing,
+                zoom,
+                tripod,
+            } = instance.kind
+            {
+                found_vidstab = true;
+                let sh = shakiness.clamp(1, 10);
+                let acc = accuracy.clamp(1, 15);
+                let sm = smoothing.clamp(0, 60);
+                let z = zoom.clamp(-20.0, 20.0);
+                let tr = if tripod { 1 } else { 0 };
+                pass1_exprs.push(format!(
+                    "vidstabdetect=shakiness={sh}:accuracy={acc}:result='{escaped_trf}'"
+                ));
+                pass2_exprs.push(format!(
+                    "vidstabtransform=input='{escaped_trf}':smoothing={sm}:zoom={z:.1}:optzoom=1:interpol=bicubic:tripod={tr}"
+                ));
+                continue;
+            }
+
+            let single = FilterPipeline {
+                filters: vec![instance.clone()],
+                next_id: self.next_id,
+            };
+            if let (Some(expr), next_w, next_h) =
+                single.to_ffmpeg_filtergraph_for_range(cur_w, cur_h, segment_virtual_range)
+            {
+                if !found_vidstab {
+                    pass1_exprs.push(expr.clone());
+                }
+                pass2_exprs.push(expr);
+                cur_w = next_w;
+                cur_h = next_h;
+            }
+        }
+
+        let p1 = if found_vidstab && !pass1_exprs.is_empty() {
+            Some(pass1_exprs.join(","))
+        } else {
+            None
+        };
+        let p2 = if pass2_exprs.is_empty() {
+            None
+        } else {
+            Some(pass2_exprs.join(","))
+        };
+        (p1, p2, cur_w, cur_h)
     }
 
     /// Applies all enabled filters in-memory to an RGBA8 buffer `(width, height, rgba_bytes)`
@@ -2297,7 +2408,7 @@ impl FilterPipeline {
                         apply_cube_lut_rgba(&mut pixels, lut_path.trim());
                     }
                 }
-                FilterKind::Deshake { .. } => {
+                FilterKind::Deshake { .. } | FilterKind::Vidstab { .. } => {
                     // Temporal multi-frame stabilization runs in FFmpeg export; preview stays unaltered.
                 }
             }

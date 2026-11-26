@@ -1951,28 +1951,6 @@ fn execute_export(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_single_segment_command(
-    binaries: &FfmpegBinaries,
-    project: &Project,
-    seg: &EditSegment,
-    filters: &FilterPipeline,
-    settings: &ExportSettings,
-    output_path: &Path,
-    seg_virtual_range: Option<(u64, u64)>,
-) -> Result<Command, ExportError> {
-    build_single_segment_command_with_pass(
-        binaries,
-        project,
-        seg,
-        filters,
-        settings,
-        output_path,
-        seg_virtual_range,
-        None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
 fn build_single_segment_command_with_pass(
     binaries: &FfmpegBinaries,
     project: &Project,
@@ -1982,6 +1960,7 @@ fn build_single_segment_command_with_pass(
     output_path: &Path,
     seg_virtual_range: Option<(u64, u64)>,
     two_pass: Option<(u8, &str)>,
+    vf_override: Option<(Option<String>, u32, u32)>,
 ) -> Result<Command, ExportError> {
     let src = project
         .source_by_id(seg.source_id)
@@ -2063,8 +2042,14 @@ fn build_single_segment_command_with_pass(
             cmd.args(["-map", &format!("0:{}", src.video_stream_index)]);
 
             // Construct video filtergraph from FilterPipeline + optional custom export resolution
-            let (mut vf_chain, out_w, out_h) =
-                filters.to_ffmpeg_filtergraph_for_range(src.width, src.height, seg_virtual_range);
+            let (mut vf_chain, out_w, out_h) = match vf_override {
+                Some((vf_opt, w, h)) => (vf_opt, w, h),
+                None => filters.to_ffmpeg_filtergraph_for_range(
+                    src.width,
+                    src.height,
+                    seg_virtual_range,
+                ),
+            };
             if let Some((req_w, req_h)) = settings.custom_resolution {
                 let w = req_w.max(2) & !1;
                 let h = req_h.max(2) & !1;
@@ -2704,6 +2689,65 @@ fn execute_single_segment_task(
         }
     }
 
+    let mut _vidstab_dir: Option<tempfile::TempDir> = None;
+    let mut vf_override: Option<(Option<String>, u32, u32)> = None;
+    if settings.processing_mode != VideoProcessingMode::DirectStreamCopy
+        && filters.has_vidstab()
+        && redub_media::ffmpeg_has_filter(&binaries.ffmpeg_path, "vidstabdetect")
+        && redub_media::ffmpeg_has_filter(&binaries.ffmpeg_path, "vidstabtransform")
+    {
+        if let Some(src) = project.source_by_id(seg.source_id) {
+            let vs_dir = tempfile::TempDir::new().map_err(ExportError::Io)?;
+            let trf_path = vs_dir.path().join("cutdub_vidstab.trf");
+            let (pass1_vf, pass2_vf, vs_w, vs_h) = filters.to_ffmpeg_vidstab_filtergraphs(
+                src.width,
+                src.height,
+                seg_virtual_range,
+                &trf_path,
+            );
+            if let Some(p1) = pass1_vf {
+                let start_pts = src.timing.frame_to_timestamp(seg.start_frame);
+                let end_pts = src.timing.frame_to_timestamp(seg.end_frame);
+                let dur_secs = ((end_pts.0 - start_pts.0).max(1_000)) as f64 / 1_000_000.0;
+                let mut vs_cmd = Command::new(&binaries.ffmpeg_path);
+                configure_background_command(&mut vs_cmd);
+                vs_cmd.args([
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-nostdin",
+                    "-y",
+                    "-progress",
+                    "pipe:1",
+                    "-nostats",
+                ]);
+                if start_pts.0 > 0 {
+                    vs_cmd
+                        .arg("-ss")
+                        .arg(format!("{:.6}", start_pts.as_seconds_f64()));
+                }
+                vs_cmd.arg("-i").arg(&src.path);
+                vs_cmd.arg("-t").arg(format!("{dur_secs:.6}"));
+                vs_cmd.args([
+                    "-map",
+                    &format!("0:{}", src.video_stream_index),
+                    "-vf",
+                    &p1,
+                    "-an",
+                    "-sn",
+                    "-f",
+                    "null",
+                    "-",
+                ]);
+                vs_cmd.stdout(Stdio::piped());
+                vs_cmd.stderr(Stdio::piped());
+                run_ffmpeg_with_progress(vs_cmd, total_duration, base_completed, cancel_flag, tx)?;
+                vf_override = Some((pass2_vf, vs_w, vs_h));
+                _vidstab_dir = Some(vs_dir);
+            }
+        }
+    }
+
     if settings.processing_mode != VideoProcessingMode::DirectStreamCopy
         && settings.two_pass
         && settings.supports_two_pass()
@@ -2724,6 +2768,7 @@ fn execute_single_segment_task(
             output_path,
             seg_virtual_range,
             Some((1, &pass_prefix)),
+            vf_override.clone(),
         )?;
         run_ffmpeg_with_progress(cmd_pass1, total_duration, base_completed, cancel_flag, tx)?;
 
@@ -2736,6 +2781,7 @@ fn execute_single_segment_task(
             output_path,
             seg_virtual_range,
             Some((2, &pass_prefix)),
+            vf_override,
         )?;
         return run_ffmpeg_with_progress(
             cmd_pass2,
@@ -2746,7 +2792,7 @@ fn execute_single_segment_task(
         );
     }
 
-    let cmd = build_single_segment_command(
+    let cmd = build_single_segment_command_with_pass(
         binaries,
         project,
         seg,
@@ -2754,6 +2800,8 @@ fn execute_single_segment_task(
         settings,
         output_path,
         seg_virtual_range,
+        None,
+        vf_override,
     )?;
     run_ffmpeg_with_progress(cmd, total_duration, base_completed, cancel_flag, tx)
 }

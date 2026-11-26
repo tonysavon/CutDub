@@ -57,6 +57,7 @@ pub enum PreviewLayoutMode {
     DualSideBySide,
     SourceOnly,
     OutputOnly,
+    SplitWipe,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -136,6 +137,7 @@ pub struct CutDubApp {
     is_measuring_loudness: bool,
 
     preview_layout: PreviewLayoutMode,
+    split_wipe_pos: f32,
     preview_zoom: PreviewZoom,
     show_right_sidebar: bool,
     active_sidebar_tab: RightSidebarTab,
@@ -263,6 +265,7 @@ impl CutDubApp {
             loudness_rx: None,
             is_measuring_loudness: false,
             preview_layout: PreviewLayoutMode::DualSideBySide,
+            split_wipe_pos: 0.5,
             preview_zoom: PreviewZoom::FitToPanel,
             show_right_sidebar: true,
             active_sidebar_tab: RightSidebarTab::Streams,
@@ -1556,6 +1559,11 @@ impl CutDubApp {
                     PreviewLayoutMode::OutputOnly,
                     "Output Panel Only",
                 );
+                ui.radio_value(
+                    &mut self.preview_layout,
+                    PreviewLayoutMode::SplitWipe,
+                    "A/B Split-Screen Wipe (Source | Output)",
+                );
 
                 ui.separator();
                 ui.label(RichText::new("Preview Zoom").strong());
@@ -1907,6 +1915,11 @@ impl CutDubApp {
                 PreviewLayoutMode::OutputOnly,
                 "Output",
             );
+            ui.selectable_value(
+                &mut self.preview_layout,
+                PreviewLayoutMode::SplitWipe,
+                "Split Wipe",
+            );
 
             egui::ComboBox::from_id_salt("zoom_combo")
                 .selected_text(format!("Zoom: {}", self.preview_zoom.label()))
@@ -2114,6 +2127,26 @@ impl CutDubApp {
                     Color32::from_rgb(80, 200, 130),
                     &mut no_crop,
                     &mut no_delogo,
+                );
+            }
+            PreviewLayoutMode::SplitWipe => {
+                let out_tex = if self.export_settings.processing_mode
+                    != VideoProcessingMode::FullProcessing
+                    && self.filters.is_empty()
+                {
+                    self.source_texture.as_ref()
+                } else {
+                    self.output_texture.as_ref().or(self.source_texture.as_ref())
+                };
+                Self::draw_split_wipe_preview_pane(
+                    ui,
+                    self.source_texture.as_ref(),
+                    src_dims,
+                    out_tex,
+                    (out_w, out_h),
+                    resolved,
+                    self.preview_zoom,
+                    &mut self.split_wipe_pos,
                 );
             }
         }
@@ -2493,6 +2526,190 @@ impl CutDubApp {
                     Color32::from_rgb(130, 140, 155),
                 );
             }
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_split_wipe_preview_pane(
+        ui: &mut Ui,
+        source_tex: Option<&TextureHandle>,
+        src_dims: (u32, u32),
+        output_tex: Option<&TextureHandle>,
+        out_dims: (u32, u32),
+        resolved: Option<ResolvedFrame>,
+        zoom: PreviewZoom,
+        split_pos: &mut f32,
+    ) {
+        let frame = egui::Frame::canvas(ui.style())
+            .fill(Color32::from_rgb(16, 18, 22))
+            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(44, 48, 58)))
+            .inner_margin(Margin::same(6));
+
+        frame.show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("A/B SPLIT WIPE")
+                        .strong()
+                        .size(11.5)
+                        .color(Color32::from_rgb(100, 215, 235)),
+                );
+                ui.label(
+                    RichText::new(format!("({:.0}%)", *split_pos * 100.0))
+                        .monospace()
+                        .size(11.0)
+                        .color(Color32::from_rgb(185, 195, 210)),
+                );
+                if ui.small_button("50%").clicked() {
+                    *split_pos = 0.5;
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if let Some(r) = resolved {
+                        let kf_badge = if r.is_keyframe { "[K]" } else { "[I/P]" };
+                        ui.label(
+                            RichText::new(format!(
+                                "Src {}×{}  |  Out {}×{}  |  Src #{} {}  |  {}",
+                                src_dims.0,
+                                src_dims.1,
+                                out_dims.0,
+                                out_dims.1,
+                                r.source_frame,
+                                kf_badge,
+                                r.virtual_pts
+                            ))
+                            .monospace()
+                            .size(11.0)
+                            .color(Color32::from_rgb(165, 175, 190)),
+                        );
+                    }
+                });
+            });
+
+            let canvas_size = ui.available_size();
+            let (rect, resp) = ui.allocate_exact_size(canvas_size, Sense::click_and_drag());
+            let painter = ui.painter_at(rect);
+            painter.rect_filled(rect, 2.0, Color32::from_rgb(11, 12, 15));
+
+            if source_tex.is_none() && output_tex.is_none() {
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "Decoding frame...",
+                    FontId::proportional(14.0),
+                    Color32::from_rgb(130, 140, 155),
+                );
+                return;
+            }
+
+            let ref_w = src_dims.0.max(out_dims.0).max(1) as f32;
+            let ref_h = src_dims.1.max(out_dims.1).max(1) as f32;
+            let viewport_size = match zoom {
+                PreviewZoom::FitToPanel => {
+                    let scale = (rect.width() / ref_w).min(rect.height() / ref_h).max(0.05);
+                    Vec2::new(ref_w * scale, ref_h * scale)
+                }
+                PreviewZoom::Scale(s) => Vec2::new(ref_w * s, ref_h * s),
+            };
+            let viewport_rect = Rect::from_center_size(rect.center(), viewport_size);
+
+            if resp.dragged() || resp.clicked() {
+                if let Some(ptr) = resp.interact_pointer_pos() {
+                    *split_pos =
+                        ((ptr.x - viewport_rect.left()) / viewport_rect.width().max(1.0))
+                            .clamp(0.02, 0.98);
+                }
+            }
+
+            let src_ar = src_dims.0.max(1) as f32 / src_dims.1.max(1) as f32;
+            let out_ar = out_dims.0.max(1) as f32 / out_dims.1.max(1) as f32;
+            let same_aspect = (src_ar - out_ar).abs() < 0.015;
+
+            let fit_inside = |container: Rect, dims: (u32, u32)| -> Rect {
+                if same_aspect {
+                    return container;
+                }
+                let dw = dims.0.max(1) as f32;
+                let dh = dims.1.max(1) as f32;
+                let s = (container.width() / dw)
+                    .min(container.height() / dh)
+                    .max(0.05);
+                Rect::from_center_size(container.center(), Vec2::new(dw * s, dh * s))
+            };
+
+            let src_rect = fit_inside(viewport_rect, src_dims);
+            let out_rect = fit_inside(viewport_rect, out_dims);
+            let split_x = viewport_rect.left() + (*split_pos).clamp(0.02, 0.98) * viewport_rect.width();
+            let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+
+            if let Some(tex) = source_tex {
+                let left_clip = Rect::from_min_max(
+                    rect.left_top(),
+                    Pos2::new(split_x, rect.bottom()),
+                );
+                painter.with_clip_rect(left_clip).image(
+                    tex.id(),
+                    src_rect,
+                    uv,
+                    Color32::WHITE,
+                );
+            }
+            if let Some(tex) = output_tex {
+                let right_clip = Rect::from_min_max(
+                    Pos2::new(split_x, rect.top()),
+                    rect.right_bottom(),
+                );
+                painter.with_clip_rect(right_clip).image(
+                    tex.id(),
+                    out_rect,
+                    uv,
+                    Color32::WHITE,
+                );
+            }
+
+            painter.rect_stroke(
+                viewport_rect,
+                0.0,
+                Stroke::new(1.0_f32, Color32::from_rgb(55, 62, 74)),
+                StrokeKind::Outside,
+            );
+
+            // Draggable vertical wipe divider & center handle pill
+            let line_col = Color32::from_rgb(95, 225, 235);
+            painter.line_segment(
+                [
+                    Pos2::new(split_x, viewport_rect.top()),
+                    Pos2::new(split_x, viewport_rect.bottom()),
+                ],
+                Stroke::new(2.0_f32, line_col),
+            );
+            let pill = Rect::from_center_size(
+                Pos2::new(split_x, viewport_rect.center().y),
+                Vec2::new(28.0, 18.0),
+            );
+            painter.rect_filled(pill, 4.0, Color32::from_rgba_unmultiplied(18, 22, 28, 220));
+            painter.rect_stroke(pill, 4.0, Stroke::new(1.5_f32, line_col), StrokeKind::Inside);
+            painter.text(
+                pill.center(),
+                egui::Align2::CENTER_CENTER,
+                "◀ ▶",
+                FontId::proportional(10.0),
+                line_col,
+            );
+
+            // Corner Source / Output labels
+            painter.text(
+                Pos2::new(viewport_rect.left() + 8.0, viewport_rect.top() + 8.0),
+                egui::Align2::LEFT_TOP,
+                "SOURCE",
+                FontId::monospace(10.5),
+                Color32::from_rgb(110, 175, 255),
+            );
+            painter.text(
+                Pos2::new(viewport_rect.right() - 8.0, viewport_rect.top() + 8.0),
+                egui::Align2::RIGHT_TOP,
+                "OUTPUT",
+                FontId::monospace(10.5),
+                Color32::from_rgb(100, 225, 150),
+            );
         });
     }
 
@@ -3710,6 +3927,17 @@ impl CutDubApp {
                     self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
                     ui.close_menu();
                 }
+                if ui.button("Pro Stabilizer (VidStab 2-Pass)").clicked() {
+                    self.filters.add(FilterKind::Vidstab {
+                        shakiness: 5,
+                        accuracy: 15,
+                        smoothing: 15,
+                        zoom: 0.0,
+                        tripod: false,
+                    });
+                    self.export_settings.processing_mode = VideoProcessingMode::FullProcessing;
+                    ui.close_menu();
+                }
             });
 
             if !self.filters.filters.is_empty() {
@@ -4706,6 +4934,30 @@ impl CutDubApp {
                                 .text("Motion Block Size"),
                         );
                         ui.checkbox(edge_mirror, "Mirror borders to hide stabilization edges");
+                    }
+                    FilterKind::Vidstab {
+                        shakiness,
+                        accuracy,
+                        smoothing,
+                        zoom,
+                        tripod,
+                    } => {
+                        if !self.capabilities.has_vidstab {
+                            ui.label(
+                                RichText::new("⚠ Installed FFmpeg lacks libvidstab — export falls back to built-in deshake.")
+                                    .size(11.0)
+                                    .color(Color32::from_rgb(235, 185, 95)),
+                            );
+                        }
+                        ui.add(egui::Slider::new(shakiness, 1..=10).text("Shakiness"));
+                        ui.add(egui::Slider::new(accuracy, 1..=15).text("Analysis Accuracy"));
+                        ui.add(egui::Slider::new(smoothing, 0..=60).text("Motion Smoothing (frames)"));
+                        ui.add(
+                            egui::Slider::new(zoom, -10.0..=15.0)
+                                .suffix("%")
+                                .text("Extra Zoom"),
+                        );
+                        ui.checkbox(tripod, "Tripod Mode (lock camera frame)");
                     }
                 }
             }
